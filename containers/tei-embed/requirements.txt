@@ -1,0 +1,11 @@
+# tei-embed container deps — pinned to brain-venv 2026-05-28 working set.
+# Versions chosen because they're empirically known to work together on the
+# host's CUDA 11.8 driver + bge-m3 + sentence-transformers stack.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.7.1+cu118
+sentence-transformers==5.4.1
+transformers==5.5.4
+fastapi==0.136.1
+uvicorn[standard]==0.44.0
+pydantic==2.13.3

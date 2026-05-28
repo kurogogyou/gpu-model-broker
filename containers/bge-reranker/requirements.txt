@@ -1,0 +1,10 @@
+# bge-reranker container deps — pinned to brain-venv 2026-05-28 working set.
+# rerankers wraps the cross-encoder loading + scoring with a uniform API.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.7.1+cu118
+transformers==5.5.4
+rerankers==0.10.0
+fastapi==0.136.1
+uvicorn[standard]==0.44.0
+pydantic==2.13.3

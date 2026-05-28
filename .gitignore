@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.python-version
+
+# Distribution / packaging
+build/
+dist/
+*.egg
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Local-only secrets / overrides
+.env
+.env.local
+config/local.yaml
+
+# Runtime artifacts
+*.log
+broker.db
+broker.sqlite
+broker-state.json
+
+# Container build artifacts (model weights baked into image layers, not committed)
+containers/*/weights/
+containers/*/.dockerignore.local

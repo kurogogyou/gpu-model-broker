@@ -1,0 +1,8 @@
+# Broker process dependencies. Each worker container has its own
+# requirements.txt with pinned model-serving deps; this file is just for
+# the orchestrator itself.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+docker==7.1.0
+pydantic==2.10.4
+PyYAML==6.0.2

@@ -1,0 +1,70 @@
+# gpu-broker role configuration.
+#
+# Each role is a worker the broker may start, stop, evict, or pin.
+# VRAM numbers are calibrated against an NVIDIA GeForce GTX 1070 (8 GiB) +
+# baseline ~660 MiB host overhead, measured 2026-05-28.
+#
+# Schema:
+#   image:                   docker image tag
+#   port:                    host port the worker listens on (inside container,
+#                            broker maps via --publish)
+#   loaded_mb:               steady-state VRAM held when model is resident
+#   activation_mb_estimate:  additional VRAM at active-inference peak (max
+#                            observed in Phase 1 measurements)
+#   idle_shutdown_seconds:   how long after last request to stop the container
+#                            (0 = never; null = always-on)
+#   co_resident_with:        roles known to safely share VRAM with this one
+#   implies:                 acquiring this role also warms these roles
+#                            (e.g. rerank implies embed)
+#   evict_on_acquire:        before starting this role, evict these others
+#   default_extra_args:      args appended to the container's exec command
+#   enabled:                 false = role is declared but the broker won't
+#                            start it (lifecycle defined for later)
+
+roles:
+
+  embed:
+    image: gpu-broker/tei-embed:latest
+    port: 8081
+    loaded_mb: 1200
+    activation_mb_estimate: 400
+    idle_shutdown_seconds: 300
+    co_resident_with: [rerank]
+    enabled: true
+
+  rerank:
+    image: gpu-broker/bge-reranker:latest
+    port: 8082
+    loaded_mb: 1200
+    activation_mb_estimate: 300
+    idle_shutdown_seconds: 300
+    co_resident_with: [embed]
+    implies: [embed]
+    enabled: true
+
+  transcribe:
+    image: gpu-broker/whisperx-server:latest
+    port: 8083
+    loaded_mb: 0            # lazy on /acquire; no always-on residency
+    activation_mb_estimate: 5800
+    idle_shutdown_seconds: 30
+    evict_on_acquire: [rerank]
+    default_extra_args:
+      - "--batch_size"
+      - "4"
+    enabled: true
+
+  llm:
+    image: gpu-broker/llm-placeholder:latest
+    port: 8084
+    loaded_mb: 5000          # placeholder for future 7B-quant
+    activation_mb_estimate: 1500
+    idle_shutdown_seconds: 600
+    evict_on_acquire: [rerank, embed, transcribe]
+    enabled: false
+
+# Host-level constraints
+gpu:
+  total_mb: 8192
+  reserved_for_host_mb: 700  # X server / desktop overhead floor
+  # Effective broker budget: total - reserved = 7492 MiB
