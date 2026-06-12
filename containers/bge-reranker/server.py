@@ -26,6 +26,8 @@ from rerankers import Reranker
 
 MODEL_NAME = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
 DTYPE_NAME = os.environ.get("RERANK_DTYPE", "fp16").lower()
+WORKER_ROLE = os.environ.get("WORKER_ROLE", "rerank")
+BROKER_VRAM_MB = int(os.environ.get("BROKER_VRAM_MB", "1500"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bge-reranker")
@@ -73,10 +75,18 @@ def _vram_mb() -> int:
     return int(torch.cuda.memory_allocated() / (1024 * 1024))
 
 
+@app.get("/healthz")
+def healthz() -> dict:
+    """Liveness only — no GPU calls, fast for HEALTHCHECK polling."""
+    return {"status": "ok"}
+
+
 @app.get("/health")
 def health() -> dict:
     return {
         "status": "ok",
+        "worker_role": WORKER_ROLE,
+        "broker_vram_mb": BROKER_VRAM_MB,
         "model": MODEL_NAME,
         "dtype": DTYPE_NAME,
         "device": "cuda" if torch.cuda.is_available() else "cpu",

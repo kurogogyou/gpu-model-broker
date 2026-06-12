@@ -1,0 +1,29 @@
+# whisperx-server container deps — pinned to ai-transcriber's known-good
+# working set (CUDA 11.8 / Pascal-compatible). Rationale lives in
+# ai-transcriber's requirements.txt and gpu-model-broker.md Decisions log;
+# the short version:
+#   - torch 2.4.0+cu118: GTX 1070 needs CUDA 11.8 wheels; torch 2.8+ is
+#     CUDA 12.x only and drops Pascal compute capability 6.1
+#   - whisperx<3.8: 3.8+ requires torch>=2.8
+#   - pyannote-audio<4.0: 4.0+ requires torch>=2.8
+#   - nvidia-cudnn-cu12==9.1.0.70: 9.20+ trips CUDNN_STATUS_EXECUTION_FAILED
+#     on Pascal
+#
+# This whole pin set unwinds when the GPU upgrade lands (5060 Ti, 3-6 month
+# horizon per self-hosted-brain-sovereignty). Keep it frozen until then.
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.4.0+cu118
+torchvision==0.19.0+cu118
+torchaudio==2.4.0+cu118
+
+whisperx==3.3.2
+pyannote-audio==3.3.2
+faster-whisper==1.1.0
+
+nvidia-cudnn-cu12==9.1.0.70
+
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4

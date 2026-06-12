@@ -20,7 +20,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_OFFLINE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip python3.10-venv ca-certificates \
+        python3.10 python3-pip python3.10-venv ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir --upgrade pip==24.3.1
 
@@ -43,11 +43,13 @@ ENV TEI_MODEL=BAAI/bge-m3 \
     TEI_DTYPE=fp16 \
     TEI_NORMALIZE=1 \
     TEI_HOST=0.0.0.0 \
-    TEI_PORT=8081
+    TEI_PORT=8081 \
+    WORKER_ROLE=embed \
+    BROKER_VRAM_MB=1600
 
 EXPOSE 8081
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8081/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8081/healthz || exit 1
 
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8081"]

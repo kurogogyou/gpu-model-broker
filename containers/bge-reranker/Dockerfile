@@ -21,7 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_OFFLINE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3.10 python3-pip python3.10-venv ca-certificates \
+        python3.10 python3-pip python3.10-venv ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir --upgrade pip==24.3.1
 
@@ -41,11 +41,13 @@ COPY server.py /app/server.py
 ENV RERANK_MODEL=BAAI/bge-reranker-v2-m3 \
     RERANK_DTYPE=fp16 \
     RERANK_HOST=0.0.0.0 \
-    RERANK_PORT=8082
+    RERANK_PORT=8082 \
+    WORKER_ROLE=rerank \
+    BROKER_VRAM_MB=1500
 
 EXPOSE 8082
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8082/health || exit 1
+    CMD curl -fsS http://127.0.0.1:8082/healthz || exit 1
 
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8082"]

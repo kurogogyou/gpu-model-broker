@@ -1,0 +1,94 @@
+# gpu-broker worker stack — DECLARATIVE ONLY, NOT FOR LIFECYCLE.
+#
+# The broker (Phase 3) owns container lifecycle: it calls the Docker SDK
+# directly with image / env / ports / volumes / labels parsed from
+# config/roles.yaml. It does NOT shell out to `docker compose up`.
+#
+# This file exists for three reasons:
+#   1. `docker compose pull` to fetch all worker images in one command after
+#      a clean checkout or fresh host install.
+#   2. Canonical declaration of how each worker is parameterized — humans
+#      can read this file to understand "what does the broker actually
+#      `docker run` when it starts a worker?" without reading SDK code.
+#   3. A manual debugging escape hatch — `docker compose --profile manual
+#      up tei-embed` to run a single worker outside the broker for
+#      isolated testing.
+#
+# Every service is gated behind `profiles: [manual]` so a bare
+# `docker compose up` does nothing — the broker, not compose, is the
+# entry point.
+#
+# Source of truth for lifecycle policy (VRAM budgets, idle-shutdown,
+# eviction) is config/roles.yaml. image + port + env + volume duplicate
+# minimally here so this file is a complete declarative view.
+
+services:
+
+  tei-embed:
+    image: gpu-broker/tei-embed:0.1.0
+    container_name: gpu-broker-tei-embed
+    profiles: [manual]
+    restart: "no"             # broker owns restarts; never compose
+    ports:
+      - "8081:8081"
+    labels:
+      gpu-broker.role: embed
+      gpu-broker.version: "0.1.0"
+    environment:
+      WORKER_ROLE: embed
+      BROKER_VRAM_MB: "1600"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  bge-reranker:
+    image: gpu-broker/bge-reranker:0.1.0
+    container_name: gpu-broker-bge-reranker
+    profiles: [manual]
+    restart: "no"
+    ports:
+      - "8082:8082"
+    labels:
+      gpu-broker.role: rerank
+      gpu-broker.version: "0.1.0"
+    environment:
+      WORKER_ROLE: rerank
+      BROKER_VRAM_MB: "1500"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  whisperx-server:
+    image: gpu-broker/whisperx-server:0.1.0
+    container_name: gpu-broker-whisperx-server
+    profiles: [manual]
+    restart: "no"
+    ports:
+      - "8083:8083"
+    labels:
+      gpu-broker.role: transcribe
+      gpu-broker.version: "0.1.0"
+    environment:
+      WORKER_ROLE: transcribe
+      BROKER_VRAM_MB: "5800"
+      HF_TOKEN: "${HF_TOKEN:-}"   # required for diarize=true; pass via shell or .env
+    volumes:
+      # Same-host convention: bind host paths into the container at the
+      # same path so callers can pass audio_path directly. Read-only is
+      # safe because whisperx writes nothing to the input path.
+      - /home/mario:/home/mario:ro
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

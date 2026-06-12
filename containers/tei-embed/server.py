@@ -29,6 +29,8 @@ from sentence_transformers import SentenceTransformer
 MODEL_NAME = os.environ.get("TEI_MODEL", "BAAI/bge-m3")
 DTYPE_NAME = os.environ.get("TEI_DTYPE", "fp16").lower()
 NORMALIZE = os.environ.get("TEI_NORMALIZE", "1") == "1"
+WORKER_ROLE = os.environ.get("WORKER_ROLE", "embed")
+BROKER_VRAM_MB = int(os.environ.get("BROKER_VRAM_MB", "1600"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tei-embed")
@@ -79,10 +81,18 @@ def _vram_mb() -> int:
     return int(torch.cuda.memory_allocated() / (1024 * 1024))
 
 
+@app.get("/healthz")
+def healthz() -> dict:
+    """Liveness only — no GPU calls, fast for HEALTHCHECK polling."""
+    return {"status": "ok"}
+
+
 @app.get("/health")
 def health() -> dict:
     return {
         "status": "ok",
+        "worker_role": WORKER_ROLE,
+        "broker_vram_mb": BROKER_VRAM_MB,
         "model": MODEL_NAME,
         "device": str(_model.device),
         "dtype": DTYPE_NAME,
