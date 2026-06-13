@@ -11,7 +11,10 @@
 # the running container has zero network dependency and cold-start is
 # bounded by SSD read speed, not network. See README for rationale.
 
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Phase 2.5 (2026-06-13): switched from cudnn8-runtime → runtime base.
+# sentence-transformers + bge-m3 don't need cuDNN — only CTranslate2 (whisperx-server) does.
+# Saves ~3.4 GB per image.
+FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -28,6 +31,15 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Phase 2.5 (2026-06-13): strip nvidia-cu12 sibling wheels. torch 2.x installs as
+# cu11/cu13 by default for this image (cuda:11.8 base) but the resolver often
+# pulls cu12-sibling shared libs as transitive deps. They're unused at runtime
+# (torch links against cu11, not cu12). Saves ~700 MB – 1 GB per image.
+RUN pip uninstall -y nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 \
+        nvidia-cuda-nvrtc-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 \
+        nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 \
+        nvidia-nccl-cu12 nvidia-nvtx-cu12 2>/dev/null || true
+
 # Bake the model weights into the image layer. Done as a separate RUN so the
 # (large) weights layer is cached independently of code changes.
 RUN HF_HOME=/models/hf-cache HF_HUB_OFFLINE=0 python3 -c "\
@@ -36,6 +48,20 @@ from sentence_transformers import SentenceTransformer; \
 m = SentenceTransformer('BAAI/bge-m3'); \
 print('model dim:', m.get_sentence_embedding_dimension()); \
 print('cached under:', os.environ['HF_HOME'])"
+
+# Phase 2.5 (2026-06-13): audit the HF cache layout per file so we KNOW what's
+# present before deciding what's safe to delete. bge-m3 ships only fp32
+# pytorch_model.bin (~2.27 GB) by default — no fp16 sibling exists — so the
+# handoff's `find -name '*.bin' -size +500M -delete` would delete the entire
+# model. Audit only at this stage; selective trim is a future optimization.
+RUN echo '=== HF cache layout (Phase 2.5 audit) ===' && \
+    du -ah /models/hf-cache 2>/dev/null | sort -rh | head -20 || true
+
+# Phase 2.5 (2026-06-13): strip __pycache__ + .pyc cruft from site-packages.
+RUN find /usr/local/lib/python3.10 /usr/lib/python3.10 \
+        -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true ; \
+    find /usr/local/lib/python3.10 /usr/lib/python3.10 \
+        -name '*.pyc' -delete 2>/dev/null || true
 
 COPY server.py /app/server.py
 

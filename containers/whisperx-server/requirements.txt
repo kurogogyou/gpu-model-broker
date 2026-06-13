@@ -22,6 +22,20 @@ whisperx==3.3.2
 pyannote-audio==3.3.2
 faster-whisper==1.1.0
 
+# Phase 2.5 (2026-06-13): pyannote-audio 3.3.2 imports matplotlib at module
+# init (pyannote.audio.tasks.segmentation.mixins) but does NOT declare it as a
+# hard install requirement — wheel resolver skips it. Pin explicitly so the
+# baked image works offline. matplotlib 3.10 series is the current stable;
+# pinned narrowly to avoid surprises.
+matplotlib>=3.7,<4.0
+
+# Phase 2.5 (2026-06-13): pyannote-audio 3.3.2's Pipeline.from_pretrained()
+# still calls hf_hub_download(use_auth_token=...) — that kwarg was removed
+# from huggingface_hub in 0.30.0 (Oct 2024) in favor of token=. Cap hf-hub
+# to a co-tested pyannote-3.3.2-era version. Lifts when we move past
+# pyannote-audio 4.0+ (which requires torch>=2.8 and is blocked by Pascal).
+huggingface-hub>=0.20,<0.27
+
 nvidia-cudnn-cu12==9.1.0.70
 
 fastapi==0.115.6
