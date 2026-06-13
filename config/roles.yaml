@@ -24,7 +24,7 @@
 roles:
 
   embed:
-    image: gpu-broker/tei-embed:latest
+    image: gpu-broker/tei-embed:0.1.0
     port: 8081
     loaded_mb: 1200
     activation_mb_estimate: 400
@@ -33,7 +33,7 @@ roles:
     enabled: true
 
   rerank:
-    image: gpu-broker/bge-reranker:latest
+    image: gpu-broker/bge-reranker:0.1.0
     port: 8082
     loaded_mb: 1200
     activation_mb_estimate: 300
@@ -43,7 +43,7 @@ roles:
     enabled: true
 
   transcribe:
-    image: gpu-broker/whisperx-server:latest
+    image: gpu-broker/whisperx-server:0.1.0
     port: 8083
     loaded_mb: 0            # lazy on /acquire; no always-on residency
     activation_mb_estimate: 5800

@@ -1,0 +1,31 @@
+[Unit]
+Description=gpu-broker — VRAM-aware Docker orchestrator for single-GPU model serving
+Documentation=file:/opt/brain/src/gpu-broker/README.md
+Documentation=file:/opt/brain/repo/Mind/projects/active/gpu-model-broker.md
+After=docker.service network.target
+Wants=docker.service
+# tei-shim.service is the legacy always-on embedder; broker supersedes it.
+# Don't force-stop tei-shim here — the Phase 4 cutover does that manually
+# after consumer migration so we keep a rollback path during the bridge week.
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/brain/src/gpu-broker
+EnvironmentFile=-/opt/brain/repo/env/.env
+Environment=BROKER_HOST=127.0.0.1
+Environment=BROKER_PORT=8090
+Environment=BROKER_LOG_LEVEL=info
+Environment=PYTHONPATH=/opt/brain/src/gpu-broker
+ExecStart=/opt/fast/venvs/gpu-broker/bin/python -m broker
+Restart=on-failure
+RestartSec=10
+# Generous startup time — the broker rediscovers running containers on boot.
+TimeoutStartSec=60
+# Don't kill our worker containers on broker stop. Workers outlive broker
+# process restarts; broker rediscovers them on next start via labels.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
