@@ -84,7 +84,11 @@ services:
       # Same-host convention: bind host paths into the container at the
       # same path so callers can pass audio_path directly. Read-only is
       # safe because whisperx writes nothing to the input path.
+      # /home/mario covers ~/bigrepo, ~/Downloads, etc.
+      # /opt/brain covers consumers that live under /opt/brain/src
+      # (ai-transcriber post-Phase-4-Task-#4, future broker-aware tools).
       - /home/mario:/home/mario:ro
+      - /opt/brain:/opt/brain:ro
     deploy:
       resources:
         reservations:

@@ -105,7 +105,15 @@ class DockerManager:
 
         volumes = {}
         if role == "transcribe":
+            # Same-host bind: the worker reads audio paths the caller passes
+            # at face value, so the host tree must appear at the same path
+            # inside the container. /home/mario covers ~/bigrepo, ~/Downloads,
+            # etc. /opt/brain covers consumers that live under /opt/brain/src
+            # (ai-transcriber post-Phase-4-Task-#4, future broker-aware tools)
+            # and any audio they stage under their repo tree. RO is safe —
+            # whisperx writes nothing to its input path.
             volumes["/home/mario"] = {"bind": "/home/mario", "mode": "ro"}
+            volumes["/opt/brain"] = {"bind": "/opt/brain", "mode": "ro"}
 
         log.info("starting container role=%s image=%s name=%s", role, cfg.image, name)
         container = self._client.containers.run(
