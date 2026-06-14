@@ -53,19 +53,44 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Phase 2.5 (2026-06-13): strip nvidia-cu12 sibling wheels — BUT NOT
-# nvidia-cudnn-cu12. CTranslate2 (the engine behind faster-whisper / whisperx)
-# links cuDNN 9 at runtime, and the base image only ships cuDNN 8 — so
-# nvidia-cudnn-cu12==9.1.0.70 from requirements.txt is the load-bearing way
-# we get cuDNN 9 into the image. Stripping it produces the runtime error
-# `ImportError: libcudnn.so.9: cannot open shared object file` at model bake.
-# This divergence vs tei-embed / bge-reranker is intentional; the other cu12
-# sibling packages are still dead weight here (torch links cu11 base libs
-# for everything except cuDNN).
-RUN pip uninstall -y nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 \
+# Phase 2.5 (2026-06-13) / Phase 4 (2026-06-14): strip nvidia-cu12 sibling
+# wheels — but keep the two load-bearing ones:
+#
+#   1. nvidia-cudnn-cu12 — CTranslate2 (the engine behind faster-whisper /
+#      whisperx) links cuDNN 9 at runtime. The base image only ships cuDNN 8,
+#      so nvidia-cudnn-cu12==9.1.0.70 from requirements.txt is the load-bearing
+#      way we get cuDNN 9 into the image. Stripping it produces
+#      `ImportError: libcudnn.so.9: cannot open shared object file` at bake.
+#
+#   2. nvidia-cublas-cu12 — CTranslate2 4.5+ (which whisperx 3.3.2 hard-requires;
+#      ctranslate2<4.5 conflicts with the whisperx pin) dlopens
+#      libcublasLt.so.12 at first /transcribe call. The base image only ships
+#      libcublasLt.so.11. Stripping was the bug that caused exit-139 SIGSEGV
+#      on the first transcribe POST in Phase 4 Task #4 smoke (2026-06-14);
+#      reinstating it matches the known-good local ai-transcriber venv
+#      (nvidia-cublas-cu12==12.8.x + ctranslate2==4.7.x).
+#
+# Other cu12 siblings remain dead weight (torch links cu11 base libs for
+# everything except cuDNN/cuBLAS).
+RUN pip uninstall -y nvidia-cuda-cupti-cu12 \
         nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 \
         nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 \
         nvidia-nccl-cu12 nvidia-nvtx-cu12 2>/dev/null || true
+
+# Phase 4 (2026-06-14): register the nvidia/{cublas,cudnn}/lib dirs with
+# ldconfig so CTranslate2's dlopen of libcublas.so.12 / libcudnn.so.9 resolves
+# at runtime. The base image's LD_LIBRARY_PATH only points at
+# /usr/local/cuda/targets/x86_64-linux/lib (cu11 libs); the cu12 .so files
+# live in pip's nvidia/* layout but aren't on the loader path by default.
+# The pre-Phase-4 ai-transcriber bash script papered over this with an
+# inline `export LD_LIBRARY_PATH=...` at invocation; here we bake it into
+# the image's ldconfig cache so every subprocess (uvicorn worker + threads)
+# sees it without arranging env vars at startup.
+RUN echo '/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib' > /etc/ld.so.conf.d/nvidia-cu12.conf && \
+    echo '/usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib' >> /etc/ld.so.conf.d/nvidia-cu12.conf && \
+    ldconfig && \
+    ldconfig -p | grep -E 'libcublas.so.12|libcublasLt.so.12|libcudnn.so.9' || \
+    (echo 'FATAL: cu12 libs still not on loader path' && exit 1)
 
 # Bake whisperx large-v3 (CTranslate2 weights) + bundled VAD into a layer.
 # HF_HUB_OFFLINE flipped to 0 only during this RUN so the download succeeds;
