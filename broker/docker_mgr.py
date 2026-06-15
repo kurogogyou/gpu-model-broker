@@ -100,8 +100,17 @@ class DockerManager:
             "WORKER_ROLE": role,
             "BROKER_VRAM_MB": str(cfg.loaded_mb + cfg.activation_mb_estimate),
         }
-        if role == "transcribe" and self._hf_token:
-            env["HF_TOKEN"] = self._hf_token
+        if role == "transcribe":
+            # PyTorch CUDA allocator fragments badly across back-to-back
+            # transcribe calls (one session leaves cached allocations that
+            # block the next session's encoder reservation even when absolute
+            # usage is in budget). expandable_segments switches to a segment
+            # allocator that handles fragmentation cleanly. Surfaced 2026-06-14
+            # on Batch 03a — first session succeeded, second OOM'd at the
+            # encode step despite the broker math fitting. PyTorch 2.1+.
+            env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+            if self._hf_token:
+                env["HF_TOKEN"] = self._hf_token
 
         volumes = {}
         if role == "transcribe":
@@ -110,10 +119,14 @@ class DockerManager:
             # inside the container. /home/mario covers ~/bigrepo, ~/Downloads,
             # etc. /opt/brain covers consumers that live under /opt/brain/src
             # (ai-transcriber post-Phase-4-Task-#4, future broker-aware tools)
-            # and any audio they stage under their repo tree. RO is safe —
-            # whisperx writes nothing to its input path.
+            # and any audio they stage under their repo tree. /mnt/bigrepo
+            # covers the canonicalized target of ~/bigrepo (the script does
+            # readlink -f before POSTing, which resolves the symlink to its
+            # /mnt/bigrepo/bigrepo backing). RO is safe — whisperx writes
+            # nothing to its input path.
             volumes["/home/mario"] = {"bind": "/home/mario", "mode": "ro"}
             volumes["/opt/brain"] = {"bind": "/opt/brain", "mode": "ro"}
+            volumes["/mnt/bigrepo"] = {"bind": "/mnt/bigrepo", "mode": "ro"}
 
         log.info("starting container role=%s image=%s name=%s", role, cfg.image, name)
         container = self._client.containers.run(
