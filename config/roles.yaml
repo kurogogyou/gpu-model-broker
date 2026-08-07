@@ -1,8 +1,10 @@
 # gpu-broker role configuration.
 #
 # Each role is a worker the broker may start, stop, evict, or pin.
-# VRAM numbers are calibrated against an NVIDIA GeForce GTX 1070 (8 GiB) +
-# baseline ~660 MiB host overhead, measured 2026-05-28.
+# VRAM numbers are calibrated against an NVIDIA GeForce RTX 3090 (24 GiB,
+# GA102, sm_86). Encoder figures carry over unchanged from the GTX 1070
+# calibration of 2026-05-28 -- they are model-footprint bound, not card bound,
+# and were re-verified against the 3090 by smoke test on 2026-08-07.
 #
 # Schema:
 #   image:                   docker image tag
@@ -20,6 +22,38 @@
 #   default_extra_args:      args appended to the container's exec command
 #   enabled:                 false = role is declared but the broker won't
 #                            start it (lifecycle defined for later)
+#
+# ---------------------------------------------------------------------------
+# THE 24 GiB CO-RESIDENCY MODEL (changed 2026-08-07, was 8 GiB)
+#
+# On the 1070 every role fought for 7.5 GiB and eviction was load-bearing. On
+# the 3090 all three encoders co-reside permanently (~8.9 GiB at simultaneous
+# peak, and transcribe's 5.8 GiB is bursty). Eviction survives for ONE case:
+# the large LLM profile, which cannot fit alongside anything.
+#
+# Two LLM roles are defined deliberately -- they are not alternatives, they are
+# the two arms of the extraction eval and both must exist to run it:
+#
+#   llm_small  Profile A -- ~6-8.5 GiB model CO-RESIDENT with the full encoder
+#              stack. Supports the LightRAG/Cognee extraction loop end to end
+#              with real KV headroom. Candidates: Bonsai 27B ternary (~6-7 GiB),
+#              Ornith-1.0-9B Dense (~6 GiB), Gemma 4 12B (~8 GiB, the trainable
+#              QLoRA target).
+#
+#   llm_large  Profile B -- ~18-21 GiB model in EXCLUSIVE residency. Higher
+#              single-model ceiling; the pipeline becomes sequential. Candidates:
+#              Gemma 4 31B QAT (~18 GiB), Qwen3.6-27B dense (~17 GiB),
+#              Laguna XS 2.1 (20.27 GiB), Ornith-35B MoE (~20 GiB).
+#
+# Second-card plan: when a second GPU lands, embed/rerank/transcribe move to it
+# and the Profile A/B tradeoff dissolves -- the 3090 is then free for llm_large
+# permanently. Noted exception, untested and speculative: running Bonsai on the
+# SMALL card concurrently with a large model on the 3090, for local agentic
+# work. That is a note, not a plan -- no tests have been run.
+#
+# Landscape, candidate table, quantization traps and revisit triggers:
+#   Mind/projects/active/gpu-broker-upgrade/context/3090-model-landscape-2026-08.md
+# ---------------------------------------------------------------------------
 
 roles:
 
@@ -29,7 +63,7 @@ roles:
     loaded_mb: 1200
     activation_mb_estimate: 400
     idle_shutdown_seconds: 300
-    co_resident_with: [rerank]
+    co_resident_with: [rerank, transcribe, llm_small]
     enabled: true
 
   rerank:
@@ -38,7 +72,7 @@ roles:
     loaded_mb: 1200
     activation_mb_estimate: 300
     idle_shutdown_seconds: 300
-    co_resident_with: [embed]
+    co_resident_with: [embed, transcribe, llm_small]
     implies: [embed]
     enabled: true
 
@@ -48,23 +82,61 @@ roles:
     loaded_mb: 0            # lazy on /acquire; no always-on residency
     activation_mb_estimate: 5800
     idle_shutdown_seconds: 30
-    evict_on_acquire: [rerank]
+    co_resident_with: [embed, rerank, llm_small]
+    # evict_on_acquire: [rerank]   <- REMOVED 2026-08-07. On 8 GiB, acquiring
+    #   transcribe had to tear down the reranker. On 24 GiB there is room for
+    #   both, and evicting a warm model to free space that already exists is
+    #   pure cost. Observed live in the 2026-08-07 smoke test, which evicted
+    #   rerank for no reason.
     default_extra_args:
       - "--batch_size"
-      - "4"
+      - "16"
+      # Was 4 -- a GTX 1070 OOM workaround (16 and 18 both OOM'd on Spanish
+      # content, therapy-corpus checklist). Not a quality setting; it is a
+      # throughput/VRAM tradeoff, so 24 GiB lifts it. NEEDS VALIDATION on a
+      # real Spanish transcription before the therapy corpus relies on it --
+      # if it regresses, drop to 8 rather than back to 4.
     enabled: true
 
-  llm:
-    image: gpu-broker/llm-placeholder:latest
+  # --- Profile A: co-resident small model ---------------------------------
+  llm_small:
+    image: gpu-broker/llm-placeholder:latest   # TODO: real serving image
     port: 8084
-    loaded_mb: 5000          # placeholder for future 7B-quant
-    activation_mb_estimate: 1500
+    loaded_mb: 8500          # Gemma 4 12B Q4 (~8 GiB) is the ceiling of this class
+    activation_mb_estimate: 2500   # KV cache; scales with context length
+    idle_shutdown_seconds: 900
+    co_resident_with: [embed, rerank, transcribe]
+    # No evict_on_acquire -- the whole point of this role is that it does not
+    # need one. Worst case with every encoder at simultaneous peak:
+    #   embed 1600 + rerank 1500 + transcribe 5800 + llm_small 11000 = 19.9 GiB
+    # against a 23.0 GiB budget. Fits with ~3.1 GiB spare.
+    enabled: false           # flip once a real serving image exists
+
+  # --- Profile B: exclusive large model ------------------------------------
+  llm_large:
+    image: gpu-broker/llm-placeholder:latest   # TODO: real serving image
+    port: 8085
+    loaded_mb: 21000         # covers the ~20 GiB class incl. KAT-Coder at 21 GiB
+    activation_mb_estimate: 2000
     idle_shutdown_seconds: 600
-    evict_on_acquire: [rerank, embed, transcribe]
-    enabled: false
+    evict_on_acquire: [embed, rerank, transcribe, llm_small]
+    # 21000 + 2000 = 23.0 GiB against a 23.0 GiB budget -- this role owns the
+    # card outright. Retrieval is unavailable while it is resident, which is
+    # the defining cost of Profile B.
+    enabled: false           # flip once a real serving image exists
 
 # Host-level constraints
 gpu:
-  total_mb: 8192
-  reserved_for_host_mb: 700  # X server / desktop overhead floor
-  # Effective broker budget: total - reserved = 7492 MiB
+  total_mb: 24576
+  reserved_for_host_mb: 1024
+  # Was 8192 / 700 for the GTX 1070. The old 700 MiB was justified as "X server
+  # / desktop overhead" -- that justification is now void: the display runs on
+  # the Haswell iGPU and X does not touch this card at all (idle 1 MiB / 27 W,
+  # AutoAddGPU off). What remains is ~400 MiB driver reserve plus a per-process
+  # CUDA context of ~300 MiB, charged once per resident worker. 1024 covers the
+  # driver reserve with fragmentation headroom.
+  #
+  # Effective broker budget: 24576 - 1024 = 23552 MiB (was 7492).
+  #
+  # NOTE: usable VRAM is ~23.3 GiB, not 24 -- plan against ~23 GiB and leave the
+  # last GiB for fragmentation. Do not size a role to the full budget.
