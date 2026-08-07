@@ -118,8 +118,22 @@ roles:
   llm_small:
     image: ollama/ollama:latest
     port: 8084
-    loaded_mb: 8500          # Gemma 4 12B Q4 (~8 GiB) is the ceiling of this class
-    activation_mb_estimate: 2500   # KV cache; scales with context length
+    # MEASURED 2026-08-07 via `ollama ps`, not inferred from download size --
+    # that mistake is why this was briefly 8500. Resident VRAM includes the KV
+    # cache, so it far exceeds the file on disk, and the gap grows with context:
+    #
+    #   model              disk    @32k ctx   @16k ctx
+    #   ornith:9b          5.6 GB    6.4 GB     5.9 GB
+    #   qwen3:8b           5.2 GB   10.0 GB     7.5 GB   <- 2x its own file
+    #   gemma4:12b         7.6 GB    8.4 GB     8.4 GB
+    #   mistral-nemo:12b   7.1 GB   12.0 GB     9.6 GB   <- worst case
+    #
+    # At the 32k default, mistral-nemo alone exceeded this role's entire budget
+    # and the ledger silently stopped describing reality. Capped to 16k (see
+    # OLLAMA_CONTEXT_LENGTH below) and sized to the measured worst case.
+    loaded_mb: 9600          # mistral-nemo:12b @ 16k, the largest arm that loads
+    activation_mb_estimate: 1400   # headroom over resident; ps SIZE already
+                                   # includes KV, so this is generation slack
     idle_shutdown_seconds: 900
     co_resident_with: [embed, rerank, transcribe]
     evict_on_acquire: [llm_large]
@@ -128,7 +142,10 @@ roles:
     # make this acquire fail on budget rather than succeed.
     # Worst case with every encoder at simultaneous peak:
     #   embed 1600 + rerank 1500 + transcribe 5800 + llm_small 11000 = 19.9 GiB
-    # against a 23.0 GiB budget. Fits with ~3.1 GiB spare.
+    # against a 23.0 GiB budget. Fits with ~3.1 GiB spare. (Totals unchanged by
+    # the 2026-08-07 re-measure -- the 8500/2500 split was wrong but the 11000
+    # sum happened to be right; it is now 9600/1400 and derived from
+    # measurement rather than luck.)
     gpu_selector: "3090"     # by NAME, never an index -- see config.py
     volumes:
       /opt/fast/ollama: /root/.ollama
@@ -136,6 +153,12 @@ roles:
       OLLAMA_HOST: "0.0.0.0:8084"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_KEEP_ALIVE: "-1"
+      # Cap context. Ollama defaults to 32768, and KV cache at that depth is
+      # what makes resident VRAM far exceed download size (mistral-nemo:12b is
+      # 7.1 GB on disk but 12 GB resident at 32k). Extraction works on chunks;
+      # 16k holds a chunk plus schema plus few-shot plus the JSON output with
+      # room to spare. Raise deliberately and re-measure, never by default.
+      OLLAMA_CONTEXT_LENGTH: "16384"
     health_path: "/"        # ollama has no /healthz; "/" answers 200
     enabled: true
 
@@ -157,6 +180,12 @@ roles:
       OLLAMA_HOST: "0.0.0.0:8085"
       OLLAMA_MAX_LOADED_MODELS: "1"
       OLLAMA_KEEP_ALIVE: "-1"
+      # Cap context. Ollama defaults to 32768, and KV cache at that depth is
+      # what makes resident VRAM far exceed download size (mistral-nemo:12b is
+      # 7.1 GB on disk but 12 GB resident at 32k). Extraction works on chunks;
+      # 16k holds a chunk plus schema plus few-shot plus the JSON output with
+      # room to spare. Raise deliberately and re-measure, never by default.
+      OLLAMA_CONTEXT_LENGTH: "16384"
     health_path: "/"        # ollama has no /healthz; "/" answers 200
     enabled: true
 

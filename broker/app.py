@@ -170,7 +170,16 @@ async def _wait_for_worker_health(endpoint: str, timeout_s: int,
                 r = await client.get(f"{endpoint}{path}")
                 if r.status_code == 200:
                     return int((time.monotonic() - start) * 1000)
-            except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+            except httpx.HTTPError:
+                # Deliberately broad. This loop already has its own deadline, so
+                # ANY transport-level failure before that deadline is just "not
+                # ready yet" and must be retried. The previous tuple
+                # (ConnectError, ReadError, RemoteProtocolError) omitted
+                # TimeoutException, so a worker that was merely SLOW to answer
+                # -- rather than not listening -- aborted the entire acquire with
+                # a 500. Hit 2026-08-07: ollama answered /healthz-equivalent in
+                # microseconds normally, but went over the 3s client timeout
+                # while a concurrent model pull saturated the same disk.
                 pass
             await asyncio.sleep(WORKER_HEALTH_POLL_S)
     raise TimeoutError(
