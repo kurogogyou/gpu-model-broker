@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass
 
@@ -74,6 +75,64 @@ class DockerManager:
         container.reload()
         return container.attrs.get("State", {}).get("Pid", 0)
 
+    # ---------- GPU affinity ----------
+
+    @staticmethod
+    def _nvidia_inventory() -> list[tuple[str, str]]:
+        """[(uuid, name), ...] from nvidia-smi. Empty list if it can't be read."""
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=uuid,name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=15, check=True,
+            ).stdout
+        except Exception as exc:  # noqa: BLE001 - any failure means "unknown"
+            log.warning("nvidia-smi inventory failed (%s); cannot pin by name", exc)
+            return []
+        rows = []
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",", 1)]
+            if len(parts) == 2 and parts[0]:
+                rows.append((parts[0], parts[1]))
+        return rows
+
+    def _device_requests_for(self, role: str, cfg: RoleConfig):
+        """Build the DeviceRequest list, honouring `gpu_selector` if set.
+
+        `count=-1` (all GPUs) is correct ONLY while exactly one card is
+        installed. With two cards it hands every worker every GPU and lets CUDA
+        pick by index -- which is how a 21 GB model ends up on an 8 GB card, or
+        an encoder silently lands on the wrong card and invalidates a thermal
+        test. Selecting by UUID is immune to slot moves and enumeration order.
+        """
+        sel = cfg.gpu_selector
+        if not sel:
+            return [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
+
+        inventory = self._nvidia_inventory()
+        if not inventory:
+            raise RuntimeError(
+                f"role={role} pins gpu_selector={sel!r} but the GPU inventory "
+                f"could not be read. Refusing to fall back to all-GPUs: that is "
+                f"how work lands on the wrong card silently."
+            )
+
+        # exact UUID first, then case-insensitive name substring
+        matches = [u for u, _ in inventory if u == sel]
+        if not matches:
+            matches = [u for u, n in inventory if sel.lower() in n.lower()]
+
+        if len(matches) != 1:
+            avail = ", ".join(f"{n} ({u})" for u, n in inventory)
+            raise RuntimeError(
+                f"role={role} gpu_selector={sel!r} matched {len(matches)} GPUs; "
+                f"need exactly 1. Installed: {avail}"
+            )
+
+        log.info("role=%s pinned to GPU %s (selector=%r)", role, matches[0], sel)
+        return [docker.types.DeviceRequest(
+            device_ids=[matches[0]], capabilities=[["gpu"]]
+        )]
+
     # ---------- lifecycle ----------
 
     def start_worker(self, role: str, cfg: RoleConfig) -> WorkerHandle:
@@ -128,6 +187,14 @@ class DockerManager:
             volumes["/opt/brain"] = {"bind": "/opt/brain", "mode": "ro"}
             volumes["/mnt/bigrepo"] = {"bind": "/mnt/bigrepo", "mode": "ro"}
 
+        # Config-driven mounts + env (roles.yaml `volumes:` / `env:`), applied
+        # after the hardcoded ones so a role can override if it ever needs to.
+        for host_path, container_path in cfg.volumes.items():
+            volumes[host_path] = {"bind": container_path, "mode": "rw"}
+        env.update(cfg.env)
+
+        device_requests = self._device_requests_for(role, cfg)
+
         log.info("starting container role=%s image=%s name=%s", role, cfg.image, name)
         container = self._client.containers.run(
             cfg.image,
@@ -141,9 +208,7 @@ class DockerManager:
                 LABEL_ROLE: role,
                 LABEL_VERSION: self._version,
             },
-            device_requests=[
-                docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]]),
-            ],
+            device_requests=device_requests,
         )
 
         # Wait briefly for the PID to appear (otherwise main_pid returns 0)

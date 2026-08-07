@@ -99,22 +99,49 @@ roles:
     enabled: true
 
   # --- Profile A: co-resident small model ---------------------------------
+  #
+  # Both LLM roles run the stock ollama/ollama image, which bundles its own
+  # CUDA userspace and is therefore completely unaffected by the CUDA 11.8
+  # Pascal pin the encoder images carry. Container CUDA is per-image; only the
+  # host DRIVER (580, CUDA 13-capable) is shared.
+  #
+  # Ollama is itself a model manager with its own lifecycle, so without care
+  # there are two layers doing the same job and the broker's VRAM ledger
+  # becomes fiction. Resolved by: one container PER PROFILE (not one shared
+  # server), OLLAMA_MAX_LOADED_MODELS=1 so a container never holds more than
+  # the ledger accounts for, and OLLAMA_KEEP_ALIVE=-1 so ollama never unloads
+  # underneath the broker. The broker owns the card; ollama owns model swapping
+  # inside its own slice.
+  #
+  # Both mount the SAME model store: a model pulled once serves either profile,
+  # and they are mutually exclusive so there is no concurrent write.
   llm_small:
-    image: gpu-broker/llm-placeholder:latest   # TODO: real serving image
+    image: ollama/ollama:latest
     port: 8084
     loaded_mb: 8500          # Gemma 4 12B Q4 (~8 GiB) is the ceiling of this class
     activation_mb_estimate: 2500   # KV cache; scales with context length
     idle_shutdown_seconds: 900
     co_resident_with: [embed, rerank, transcribe]
-    # No evict_on_acquire -- the whole point of this role is that it does not
-    # need one. Worst case with every encoder at simultaneous peak:
+    evict_on_acquire: [llm_large]
+    # Does NOT evict the encoders -- that is the entire point of Profile A.
+    # It does evict llm_large, which would otherwise hold the whole card and
+    # make this acquire fail on budget rather than succeed.
+    # Worst case with every encoder at simultaneous peak:
     #   embed 1600 + rerank 1500 + transcribe 5800 + llm_small 11000 = 19.9 GiB
     # against a 23.0 GiB budget. Fits with ~3.1 GiB spare.
-    enabled: false           # flip once a real serving image exists
+    gpu_selector: "3090"     # by NAME, never an index -- see config.py
+    volumes:
+      /opt/fast/ollama: /root/.ollama
+    env:
+      OLLAMA_HOST: "0.0.0.0:8084"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "-1"
+    health_path: "/"        # ollama has no /healthz; "/" answers 200
+    enabled: true
 
   # --- Profile B: exclusive large model ------------------------------------
   llm_large:
-    image: gpu-broker/llm-placeholder:latest   # TODO: real serving image
+    image: ollama/ollama:latest
     port: 8085
     loaded_mb: 21000         # covers the ~20 GiB class incl. KAT-Coder at 21 GiB
     activation_mb_estimate: 2000
@@ -123,7 +150,15 @@ roles:
     # 21000 + 2000 = 23.0 GiB against a 23.0 GiB budget -- this role owns the
     # card outright. Retrieval is unavailable while it is resident, which is
     # the defining cost of Profile B.
-    enabled: false           # flip once a real serving image exists
+    gpu_selector: "3090"
+    volumes:
+      /opt/fast/ollama: /root/.ollama
+    env:
+      OLLAMA_HOST: "0.0.0.0:8085"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+      OLLAMA_KEEP_ALIVE: "-1"
+    health_path: "/"        # ollama has no /healthz; "/" answers 200
+    enabled: true
 
 # Host-level constraints
 gpu:

@@ -38,7 +38,13 @@ IDLE_SWEEP_INTERVAL_S = 5
 # ---------- request/response models ----------
 
 class AcquireRequest(BaseModel):
-    role: Literal["embed", "rerank", "transcribe", "llm"]
+    # Deliberately NOT a Literal. Role names are defined in config/roles.yaml;
+    # hardcoding them here meant a role added to config could never be acquired
+    # (hit 2026-08-07 adding llm_small / llm_large -- the config parsed, the
+    # broker started, and /acquire returned 422 against a stale literal that
+    # still said "llm"). Validated against the loaded config in the handler,
+    # matching how /admin/pin/{role} already does it.
+    role: str = Field(min_length=1, max_length=64)
     client_id: str = Field(min_length=1, max_length=128)
     hint_vram_mb: int | None = None
     hold_seconds: int | None = Field(default=None, ge=0)
@@ -145,20 +151,31 @@ def _state() -> State:
 
 # ---------- worker readiness ----------
 
-async def _wait_for_worker_health(endpoint: str, timeout_s: int) -> int:
-    """Poll <endpoint>/healthz until 200 or timeout. Returns elapsed ms."""
+async def _wait_for_worker_health(endpoint: str, timeout_s: int,
+                                  health_path: str = "/healthz") -> int:
+    """Poll <endpoint><health_path> until 200 or timeout. Returns elapsed ms.
+
+    health_path is per-role because it is a property of the WORKER IMAGE, not
+    of the broker. The three encoder images implement /healthz; ollama does not
+    (it answers "/" and "/api/tags"), so hardcoding /healthz made an ollama
+    worker hang until timeout while the container was up and serving normally
+    -- a readiness probe that can never pass looks exactly like a broken model.
+    """
     start = time.monotonic()
     deadline = start + timeout_s
+    path = health_path if health_path.startswith("/") else f"/{health_path}"
     async with httpx.AsyncClient(timeout=httpx.Timeout(3.0)) as client:
         while time.monotonic() < deadline:
             try:
-                r = await client.get(f"{endpoint}/healthz")
+                r = await client.get(f"{endpoint}{path}")
                 if r.status_code == 200:
                     return int((time.monotonic() - start) * 1000)
             except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
                 pass
             await asyncio.sleep(WORKER_HEALTH_POLL_S)
-    raise TimeoutError(f"worker at {endpoint} did not become healthy in {timeout_s}s")
+    raise TimeoutError(
+        f"worker at {endpoint} did not answer 200 on {path} in {timeout_s}s"
+    )
 
 
 # ---------- endpoints ----------
@@ -172,6 +189,17 @@ async def broker_health():
           responses={503: {"model": InfeasibleResponse}})
 async def acquire(req: AcquireRequest):
     state = _state()
+    if req.role not in state.cfg.roles:
+        raise HTTPException(
+            status_code=404,
+            detail=f"unknown role: {req.role}. "
+                   f"known: {sorted(state.cfg.roles)}",
+        )
+    if not state.cfg.roles[req.role].enabled:
+        raise HTTPException(
+            status_code=409,
+            detail=f"role {req.role} is declared but disabled (enabled: false)",
+        )
     async with state.lock:
         plan = policy.plan_acquire(state, req.role)
         if not plan.feasible:
@@ -202,7 +230,10 @@ async def acquire(req: AcquireRequest):
             start_t = time.monotonic()
             handle = await asyncio.to_thread(state.docker.start_worker, req.role, cfg)
             worker = state.add_worker(req.role, handle)
-            wait_ms = await _wait_for_worker_health(worker.endpoint, WORKER_HEALTH_TIMEOUT_S)
+            wait_ms = await _wait_for_worker_health(
+                worker.endpoint, WORKER_HEALTH_TIMEOUT_S,
+                state.cfg.roles[req.role].health_path,
+            )
             cold_start_total += int((time.monotonic() - start_t) * 1000)
         else:
             state.touch_worker(req.role)
@@ -216,7 +247,10 @@ async def acquire(req: AcquireRequest):
             icfg = state.cfg.roles[implied_role]
             ihandle = await asyncio.to_thread(state.docker.start_worker, implied_role, icfg)
             iworker = state.add_worker(implied_role, ihandle)
-            await _wait_for_worker_health(iworker.endpoint, WORKER_HEALTH_TIMEOUT_S)
+            await _wait_for_worker_health(
+                iworker.endpoint, WORKER_HEALTH_TIMEOUT_S,
+                state.cfg.roles[implied_role].health_path,
+            )
             warmed.append(implied_role)
 
         # 4. Create client handle

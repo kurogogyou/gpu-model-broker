@@ -13,7 +13,10 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator
 
-RoleName = Literal["embed", "rerank", "transcribe", "llm"]
+# NOTE: declarative only -- nothing validates against this (BrokerConfig.roles
+# is keyed by plain str). Kept in sync by hand so it does not mislead; the
+# single `llm` role became `llm_small` / `llm_large` on 2026-08-07.
+RoleName = Literal["embed", "rerank", "transcribe", "llm_small", "llm_large"]
 
 
 class RoleConfig(BaseModel):
@@ -27,6 +30,29 @@ class RoleConfig(BaseModel):
     evict_on_acquire: list[str] = Field(default_factory=list)
     default_extra_args: list[str] = Field(default_factory=list)
     enabled: bool = True
+
+    # --- multi-GPU + generic-worker support (added 2026-08-07) --------------
+    # gpu_selector: which physical GPU this role's container may see. Accepts a
+    # full UUID ("GPU-4c536cab-...") or a case-insensitive substring of the card
+    # NAME ("3090", "3060"); resolved to a UUID at container-start time.
+    # NEVER an index -- nvidia-smi and CUDA disagree about what "0" means once a
+    # second card is present, and PCI paths renumber on a slot move.
+    # None = every GPU visible, which is the pre-multi-GPU behaviour and is only
+    # safe while exactly one card is installed.
+    gpu_selector: str | None = None
+
+    # Extra bind mounts, host_path -> container_path. Previously every mount was
+    # hardcoded per-role inside docker_mgr; roles needing their own storage (the
+    # LLM roles need a model store) declare it here instead.
+    volumes: dict[str, str] = Field(default_factory=dict)
+
+    # Extra environment for the worker container, merged over the broker's own.
+    env: dict[str, str] = Field(default_factory=dict)
+
+    # Readiness probe path. A property of the WORKER IMAGE, not of the broker.
+    # The three encoder images serve /healthz; ollama does not (it answers "/"),
+    # and a probe that can never pass is indistinguishable from a broken model.
+    health_path: str = "/healthz"
 
 
 class GpuConfig(BaseModel):
