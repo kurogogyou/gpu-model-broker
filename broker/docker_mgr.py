@@ -13,6 +13,11 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+# Interface worker container ports are published on. Loopback by default --
+# see the note at the ports= kwarg in start_worker(). Override only once an
+# authenticated path (reverse proxy / WireGuard) fronts the workers.
+WORKER_BIND_HOST = os.environ.get("BROKER_WORKER_BIND_HOST", "127.0.0.1")
+
 import docker
 from docker.models.containers import Container
 
@@ -201,7 +206,14 @@ class DockerManager:
             name=name,
             detach=True,
             remove=False,
-            ports={f"{cfg.port}/tcp": cfg.port},
+            # Bind workers to LOOPBACK explicitly. docker-py's short form
+            # ({"8081/tcp": 8081}) publishes on 0.0.0.0, which put every model
+            # endpoint on the LAN unauthenticated -- and a caller reaching a
+            # worker directly never goes through /acquire, so the VRAM ledger
+            # silently stops describing reality. Found 2026-08-07. LAN access
+            # is a deliberate feature to be built (auth at the network layer +
+            # a reverse proxy), not a side effect of a default.
+            ports={f"{cfg.port}/tcp": (WORKER_BIND_HOST, cfg.port)},
             environment=env,
             volumes=volumes,
             labels={
