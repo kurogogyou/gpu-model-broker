@@ -122,17 +122,20 @@ roles:
     # that mistake is why this was briefly 8500. Resident VRAM includes the KV
     # cache, so it far exceeds the file on disk, and the gap grows with context:
     #
-    #   model              disk    @32k ctx   @16k ctx
-    #   ornith:9b          5.6 GB    6.4 GB     5.9 GB
-    #   qwen3:8b           5.2 GB   10.0 GB     7.5 GB   <- 2x its own file
-    #   gemma4:12b         7.6 GB    8.4 GB     8.4 GB
-    #   mistral-nemo:12b   7.1 GB   12.0 GB     9.6 GB   <- worst case
+    #   model             disk   32k/f16  16k/f16  16k/q8_0  32k/q8_0
+    #   ornith:9b         5.6 GB   6.4 GB   5.9 GB   5.6 GB    6.0 GB
+    #   qwen3:8b          5.2 GB  10.0 GB   7.5 GB   6.4 GB    7.7 GB
+    #   gemma4:12b        7.6 GB   8.4 GB   8.4 GB   8.1 GB    8.1 GB
+    #   mistral-nemo:12b  7.1 GB  12.0 GB   9.6 GB   8.4 GB    9.7 GB  <- worst
+    #
+    # The q8_0 column is why context went back to 32k: 32k with q8_0 KV costs
+    # 9.7 GB where 16k with f16 KV cost 9.6 GB. Double the context for 0.1 GB.
     #
     # At the 32k default, mistral-nemo alone exceeded this role's entire budget
     # and the ledger silently stopped describing reality. Capped to 16k (see
     # OLLAMA_CONTEXT_LENGTH below) and sized to the measured worst case.
-    loaded_mb: 9600          # mistral-nemo:12b @ 16k, the largest arm that loads
-    activation_mb_estimate: 1400   # headroom over resident; ps SIZE already
+    loaded_mb: 9800          # mistral-nemo:12b @ 32k + q8_0 KV = 9.7 GB measured
+    activation_mb_estimate: 1200   # headroom over resident; ps SIZE already
                                    # includes KV, so this is generation slack
     idle_shutdown_seconds: 900
     co_resident_with: [embed, rerank, transcribe]
@@ -158,7 +161,22 @@ roles:
       # 7.1 GB on disk but 12 GB resident at 32k). Extraction works on chunks;
       # 16k holds a chunk plus schema plus few-shot plus the JSON output with
       # room to spare. Raise deliberately and re-measure, never by default.
-      OLLAMA_CONTEXT_LENGTH: "16384"
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      # q8_0 KV cache. MEASURED 2026-08-07 against f16 at the same 16k context:
+      #   mistral-nemo:12b  9.6 -> 8.4 GB   qwen3:8b    7.5 -> 6.4 GB
+      #   gemma4:12b        8.4 -> 8.1 GB   ornith:9b   5.9 -> 5.6 GB
+      # Savings scale with KV size, so long-context architectures gain most.
+      # q8_0 is near-lossless; q4_0 is NOT -- it degrades the way the landscape
+      # doc's quantization warning describes, so do not "optimize" further.
+      # Flash attention already auto-enables, but pin it: q8_0 KV silently
+      # requires it, and relying on an "auto" for a correctness precondition is
+      # how this breaks quietly on some future model.
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+      # n_slots is 1 today, so KV is allocated once. Raising NUM_PARALLEL for
+      # extraction throughput multiplies KV by exactly that factor -- re-measure
+      # and re-size loaded_mb before doing it.
+      OLLAMA_NUM_PARALLEL: "1"
     health_path: "/"        # ollama has no /healthz; "/" answers 200
     enabled: true
 
@@ -185,7 +203,22 @@ roles:
       # 7.1 GB on disk but 12 GB resident at 32k). Extraction works on chunks;
       # 16k holds a chunk plus schema plus few-shot plus the JSON output with
       # room to spare. Raise deliberately and re-measure, never by default.
-      OLLAMA_CONTEXT_LENGTH: "16384"
+      OLLAMA_CONTEXT_LENGTH: "32768"
+      # q8_0 KV cache. MEASURED 2026-08-07 against f16 at the same 16k context:
+      #   mistral-nemo:12b  9.6 -> 8.4 GB   qwen3:8b    7.5 -> 6.4 GB
+      #   gemma4:12b        8.4 -> 8.1 GB   ornith:9b   5.9 -> 5.6 GB
+      # Savings scale with KV size, so long-context architectures gain most.
+      # q8_0 is near-lossless; q4_0 is NOT -- it degrades the way the landscape
+      # doc's quantization warning describes, so do not "optimize" further.
+      # Flash attention already auto-enables, but pin it: q8_0 KV silently
+      # requires it, and relying on an "auto" for a correctness precondition is
+      # how this breaks quietly on some future model.
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
+      # n_slots is 1 today, so KV is allocated once. Raising NUM_PARALLEL for
+      # extraction throughput multiplies KV by exactly that factor -- re-measure
+      # and re-size loaded_mb before doing it.
+      OLLAMA_NUM_PARALLEL: "1"
     health_path: "/"        # ollama has no /healthz; "/" answers 200
     enabled: true
 
