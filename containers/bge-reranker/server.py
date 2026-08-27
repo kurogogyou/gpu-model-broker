@@ -21,6 +21,7 @@ from typing import Literal
 
 import torch
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from rerankers import Reranker
 
@@ -99,7 +100,11 @@ def rerank(req: RerankRequest) -> RerankResponse:
     if not req.docs:
         return RerankResponse(model=MODEL_NAME, results=[], rerank_ms=0.0, num_docs=0)
     t0 = time.time()
-    ranking = _reranker.rank(query=req.query, docs=req.docs)
+    try:
+        ranking = _reranker.rank(query=req.query, docs=req.docs)
+    except Exception as e:
+        _mark_model_broken(e)
+        raise
     dt = (time.time() - t0) * 1000
     log.info(f"reranked {len(req.docs)} docs in {dt:.1f}ms")
 
@@ -123,4 +128,48 @@ def rerank(req: RerankRequest) -> RerankResponse:
         results=items,
         rerank_ms=dt,
         num_docs=len(req.docs),
+    )
+
+
+# --- Readiness that actually exercises the model (added 2026-08-27) ---------
+# `/healthz` is liveness only and returns 200 even when every inference fails —
+# on 2026-08-27 the sibling embed container reported `health=healthy` with 0
+# restarts while 100% of requests died on `CUDA error: no kernel image is
+# available` (sm_120 vs a cu118 build). Nothing alerted. `/readyz` reflects
+# real model health.
+#
+# Deliberately NOT a periodic GPU call: the broker idle-shuts-down workers, so
+# a healthcheck touching the GPU every 30s would pin VRAM forever. Self-test
+# ONCE at startup, then latch on the first inference failure.
+_MODEL_OK: bool = False
+_MODEL_ERR: str | None = None
+
+
+def _mark_model_broken(e: BaseException) -> None:
+    global _MODEL_OK, _MODEL_ERR
+    _MODEL_OK = False
+    _MODEL_ERR = f"{type(e).__name__}: {e}"
+    log.error(f"model marked UNHEALTHY: {_MODEL_ERR}")
+
+
+try:
+    _reranker.rank(query="readiness self-test", docs=["a", "b"])
+    _MODEL_OK = True
+    log.info("startup self-test PASSED — model executes on this device")
+except Exception as _e:  # noqa: BLE001
+    _mark_model_broken(_e)
+    log.error("startup self-test FAILED — /readyz will report 503")
+
+
+@app.get("/readyz")
+def readyz():
+    """Readiness — 503 unless the model has actually executed on this device."""
+    if _MODEL_OK:
+        return {"status": "ok", "arch_list": torch.cuda.get_arch_list()}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "unhealthy", "error": _MODEL_ERR,
+                 "arch_list": torch.cuda.get_arch_list(),
+                 "device_capability": list(torch.cuda.get_device_capability())
+                 if torch.cuda.is_available() else None},
     )

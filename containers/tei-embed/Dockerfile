@@ -14,7 +14,7 @@
 # Phase 2.5 (2026-06-13): switched from cudnn8-runtime → runtime base.
 # sentence-transformers + bge-m3 don't need cuDNN — only CTranslate2 (whisperx-server) does.
 # Saves ~3.4 GB per image.
-FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -31,14 +31,10 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Phase 2.5 (2026-06-13): strip nvidia-cu12 sibling wheels. torch 2.x installs as
-# cu11/cu13 by default for this image (cuda:11.8 base) but the resolver often
-# pulls cu12-sibling shared libs as transitive deps. They're unused at runtime
-# (torch links against cu11, not cu12). Saves ~700 MB – 1 GB per image.
-RUN pip uninstall -y nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 \
-        nvidia-cuda-nvrtc-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 \
-        nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 \
-        nvidia-nccl-cu12 nvidia-nvtx-cu12 2>/dev/null || true
+# Phase 2.5's `pip uninstall nvidia-*-cu12` block was REMOVED 2026-08-27 with the
+# CUDA 12.8 rebase. It stripped cu12 sibling wheels as dead weight under the cu11
+# base; under torch 2.7.1+cu128 those are exactly the libs torch links against, so
+# keeping it would break the image at import. Do not reinstate it on a cu12x base.
 
 # Bake the model weights into the image layer. Done as a separate RUN so the
 # (large) weights layer is cached independently of code changes.
@@ -76,6 +72,6 @@ ENV TEI_MODEL=BAAI/bge-m3 \
 EXPOSE 8081
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8081/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8081/readyz || exit 1
 
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8081"]

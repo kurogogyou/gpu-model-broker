@@ -58,7 +58,7 @@
 roles:
 
   embed:
-    image: gpu-broker/tei-embed:0.1.0
+    image: gpu-broker/tei-embed:0.2.0
     port: 8081
     loaded_mb: 1200
     activation_mb_estimate: 400
@@ -67,7 +67,7 @@ roles:
     enabled: true
 
   rerank:
-    image: gpu-broker/bge-reranker:0.1.0
+    image: gpu-broker/bge-reranker:0.2.0
     port: 8082
     loaded_mb: 1200
     activation_mb_estimate: 300
@@ -237,3 +237,23 @@ gpu:
   #
   # NOTE: usable VRAM is ~23.3 GiB, not 24 -- plan against ~23 GiB and leave the
   # last GiB for fragmentation. Do not size a role to the full budget.
+  #
+  # RE-MEASURED ON SCULLY 2026-08-27 -- value CONFIRMED, do not lower it.
+  # The host moved to the AM5 box (B850M-A, AMD iGPU drives both monitors via
+  # BIOS Primary Display = IGFX; the "Haswell iGPU" above refers to FATEBURN).
+  # It is tempting to cut this now that the display tax is provably zero, but
+  # that saving was ALREADY taken when this went from 700 -> 1024: the 1024 is
+  # driver reserve + fragmentation headroom, NOT desktop overhead.
+  #
+  # Measured idle, nothing resident:  total 24576 | used 15 | free 24110 MiB
+  #   -> 24576 - 15 - 24110 = 451 MiB the driver holds back and never reports
+  #      as "used". That is the "~400 MiB driver reserve" above, confirmed.
+  #   -> 15 MiB is the entire cost of the desktop being elsewhere. Already
+  #      accounted for; there is nothing left to reclaim from it.
+  # Trimming 1024 -> ~640 would recover ~384 MiB, unlock no new model tier, and
+  # spend exactly the fragmentation headroom the NOTE above asks for.
+  #
+  # Full reasoning + the soak that produced these numbers:
+  # Mind/projects/active/self-hosted-brain-sovereignty/decisions.md
+  #   § "acpi_enforce_resources=lax makes SMBus RGB tooling a RAM-corruption
+  #      risk on Scully (2026-08-27)" -> subsection "3090 acceptance re-run".
