@@ -1,22 +1,40 @@
-# whisperx-server container deps — pinned to ai-transcriber's known-good
-# working set (CUDA 11.8 / Pascal-compatible). Rationale lives in
-# ai-transcriber's requirements.txt and gpu-model-broker.md Decisions log;
-# the short version:
-#   - torch 2.4.0+cu118: GTX 1070 needs CUDA 11.8 wheels; torch 2.8+ is
-#     CUDA 12.x only and drops Pascal compute capability 6.1
-#   - whisperx<3.8: 3.8+ requires torch>=2.8
-#   - pyannote-audio<4.0: 4.0+ requires torch>=2.8
-#   - nvidia-cudnn-cu12==9.1.0.70: 9.20+ trips CUDNN_STATUS_EXECUTION_FAILED
-#     on Pascal
+# whisperx-server container deps.
 #
-# This whole pin set unwinds when the GPU upgrade lands (5060 Ti, 3-6 month
-# horizon per self-hosted-brain-sovereignty). Keep it frozen until then.
+# REBASED 2026-08-28 to CUDA 12.8 / Blackwell sm_120. The previous pin set was
+# built around a GTX 1070 (Pascal, sm_61) and is recorded here because every
+# constraint in it was a CONSEQUENCE of that card, not of whisperx:
+#   - torch 2.4.0+cu118  : Pascal needed CUDA 11.8 wheels
+#   - whisperx<3.8       : 3.8+ requires torch>=2.8
+#   - pyannote-audio<4.0 : 4.0+ requires torch>=2.8
+#   - nvidia-cudnn-cu12==9.1.0.70 : 9.20+ tripped CUDNN_STATUS_EXECUTION_FAILED
+#                                   ON PASCAL specifically
+# The 1070 is gone and the installed card is a 5060 Ti, so the CUDA half of
+# that set is void.
+#
+# What actually changed: torch/vision/audio only. whisperx 3.3.2 and
+# pyannote-audio 3.3.2 are KEPT. Checked against their real metadata rather
+# than assumed: whisperx 3.3.2 declares `torch>=2`, `torchaudio>=2`,
+# `ctranslate2>=4.5.0` and pyannote-audio 3.3.2 declares `torch>=2.0.0`,
+# `torchaudio>=2.2.0` -- no upper bounds. Those two were pinned to hold TORCH
+# down for Pascal, not because they reject a newer torch. Moving to
+# whisperx 3.8 / pyannote 4.0 is therefore an independent, optional upgrade
+# and deliberately NOT bundled into a CUDA rebase.
+#
+# nvidia-cudnn-cu12 is no longer pinned here: the Pascal bug it avoided is
+# irrelevant, the 12.8.1-cudnn base ships cuDNN 9 natively, and torch
+# 2.7.1+cu128 pulls its own co-tested cudnn (9.7.1.26). Pinning 9.1.0.70
+# against it would conflict.
+#
+# CTranslate2 (the faster-whisper engine) needed no change and was verified
+# BEFORE the rebuild: ct2 4.8.0 in the old image already sees the 5060 Ti and
+# reports float16/bfloat16 among its CUDA compute types. The engine was never
+# the sm_120 blocker -- torch was.
 
---extra-index-url https://download.pytorch.org/whl/cu118
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-torch==2.4.0+cu118
-torchvision==0.19.0+cu118
-torchaudio==2.4.0+cu118
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128
+torchaudio==2.7.1+cu128
 
 whisperx==3.3.2
 pyannote-audio==3.3.2
@@ -36,7 +54,7 @@ matplotlib>=3.7,<4.0
 # pyannote-audio 4.0+ (which requires torch>=2.8 and is blocked by Pascal).
 huggingface-hub>=0.20,<0.27
 
-nvidia-cudnn-cu12==9.1.0.70
+# nvidia-cudnn-cu12: intentionally UNPINNED (see header).
 
 fastapi==0.115.6
 uvicorn[standard]==0.34.0

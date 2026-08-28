@@ -95,7 +95,7 @@ roles:
     # the SOLE installed card (gpu_ledger.resolve_placement), so this
     # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
     gpu_selector: "5060 Ti"
-    image: gpu-broker/whisperx-server:0.1.0
+    image: gpu-broker/whisperx-server:0.2.0
     port: 8083
     loaded_mb: 0            # lazy on /acquire; no always-on residency
     activation_mb_estimate: 5800

@@ -34,7 +34,7 @@
 # CTranslate2 (the engine behind faster-whisper / whisperx) links against
 # cuDNN at runtime. tei-embed + bge-reranker switched to the plain runtime
 # base. Per-image base-image divergence is intentional.
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -53,29 +53,13 @@ WORKDIR /app
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Phase 2.5 (2026-06-13) / Phase 4 (2026-06-14): strip nvidia-cu12 sibling
-# wheels — but keep the two load-bearing ones:
-#
-#   1. nvidia-cudnn-cu12 — CTranslate2 (the engine behind faster-whisper /
-#      whisperx) links cuDNN 9 at runtime. The base image only ships cuDNN 8,
-#      so nvidia-cudnn-cu12==9.1.0.70 from requirements.txt is the load-bearing
-#      way we get cuDNN 9 into the image. Stripping it produces
-#      `ImportError: libcudnn.so.9: cannot open shared object file` at bake.
-#
-#   2. nvidia-cublas-cu12 — CTranslate2 4.5+ (which whisperx 3.3.2 hard-requires;
-#      ctranslate2<4.5 conflicts with the whisperx pin) dlopens
-#      libcublasLt.so.12 at first /transcribe call. The base image only ships
-#      libcublasLt.so.11. Stripping was the bug that caused exit-139 SIGSEGV
-#      on the first transcribe POST in Phase 4 Task #4 smoke (2026-06-14);
-#      reinstating it matches the known-good local ai-transcriber venv
-#      (nvidia-cublas-cu12==12.8.x + ctranslate2==4.7.x).
-#
-# Other cu12 siblings remain dead weight (torch links cu11 base libs for
-# everything except cuDNN/cuBLAS).
-RUN pip uninstall -y nvidia-cuda-cupti-cu12 \
-        nvidia-cuda-nvrtc-cu12 nvidia-cufft-cu12 \
-        nvidia-curand-cu12 nvidia-cusolver-cu12 nvidia-cusparse-cu12 \
-        nvidia-nccl-cu12 nvidia-nvtx-cu12 2>/dev/null || true
+# The Phase 2.5/Phase 4 `pip uninstall nvidia-*-cu12` block was REMOVED
+# 2026-08-28 with the CUDA 12.8 rebase. It stripped cu12 sibling wheels as
+# dead weight because the BASE was cu11 and torch linked cu11 for everything
+# except cuDNN/cuBLAS. Under torch 2.7.1+cu128 those siblings are exactly the
+# libs torch links against, so the block would now break the image at import.
+# Do not reinstate it on a cu12x base. (Its two carve-outs for cudnn/cublas
+# are also moot: the 12.8.1-cudnn base ships both natively.)
 
 # Phase 4 (2026-06-14): register the nvidia/{cublas,cudnn}/lib dirs with
 # ldconfig so CTranslate2's dlopen of libcublas.so.12 / libcudnn.so.9 resolves
@@ -95,7 +79,14 @@ RUN echo '/usr/local/lib/python3.10/dist-packages/nvidia/cublas/lib' > /etc/ld.s
 # Bake whisperx large-v3 (CTranslate2 weights) + bundled VAD into a layer.
 # HF_HUB_OFFLINE flipped to 0 only during this RUN so the download succeeds;
 # the runtime ENV (set above) stays at 1, blocking any drift.
+# torch 2.6+ flipped torch.load(weights_only) to True and pyannote 3.3.2's
+# checkpoints carry omegaconf objects; torch_compat allowlists those specific
+# types rather than disabling the safe default globally. Needed at BAKE time as
+# well as runtime, so it is copied before this step. See torch_compat.py.
+COPY torch_compat.py /app/torch_compat.py
+
 RUN HF_HUB_OFFLINE=0 python3 -c "\
+import torch_compat; torch_compat.install(); \
 import whisperx; \
 m = whisperx.load_model('large-v3', device='cpu', compute_type='int8', language='en'); \
 print('whisperx large-v3 cached')"
@@ -146,7 +137,7 @@ RUN find /usr/local/lib/python3.10 /usr/lib/python3.10 \
 COPY server.py /app/server.py
 
 ENV WHISPERX_MODEL=large-v3 \
-    WHISPERX_COMPUTE_TYPE=int8 \
+    WHISPERX_COMPUTE_TYPE=float16 \
     WHISPERX_DEVICE=cuda \
     WHISPERX_DEFAULT_BATCH_SIZE=4 \
     WHISPERX_HOST=0.0.0.0 \
@@ -166,6 +157,6 @@ EXPOSE 8083
 # 240s start-period — whisperx large-v3 cold-load on a Pascal GPU is slow
 # (~30s for the CTranslate2 weights, plus alignment model warmup).
 HEALTHCHECK --interval=30s --timeout=10s --start-period=240s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8083/healthz || exit 1
+    CMD curl -fsS http://127.0.0.1:8083/readyz || exit 1
 
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8083"]

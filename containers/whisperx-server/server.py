@@ -44,6 +44,9 @@ BROKER_VRAM_MB = int(os.environ.get("BROKER_VRAM_MB", "5800"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("whisperx-server")
 
+import torch_compat  # noqa: E402 — must run before whisperx/pyannote load checkpoints
+torch_compat.install()
+
 log.info(f"Loading whisperx {MODEL_NAME} compute_type={COMPUTE_TYPE} device={DEVICE}")
 _t0 = time.time()
 _asr_model = whisperx.load_model(
@@ -167,7 +170,11 @@ def transcribe(req: TranscribeRequest) -> TranscribeResponse:
 
     # Pass 1: transcription
     t0 = time.time()
-    result = _asr_model.transcribe(audio, batch_size=batch_size, language=req.language)
+    try:
+        result = _asr_model.transcribe(audio, batch_size=batch_size, language=req.language)
+    except Exception as e:
+        _mark_model_broken(e)
+        raise
     transcribe_ms = (time.time() - t0) * 1000
     detected_language = result["language"]
     log.info(f"transcribed {duration_s:.1f}s audio in {transcribe_ms / 1000:.1f}s (language={detected_language})")
@@ -220,4 +227,59 @@ def transcribe(req: TranscribeRequest) -> TranscribeResponse:
         transcribe_ms=transcribe_ms,
         align_ms=align_ms,
         diarize_ms=diarize_ms,
+    )
+
+
+# --- Readiness that actually exercises the model (added 2026-08-28) ---------
+# `/healthz` is liveness only. On 2026-08-27 the sibling embed container
+# reported health=healthy with 0 restarts while 100% of requests died on
+# `CUDA error: no kernel image is available` (sm_120 vs a cu118 build), because
+# its healthcheck probed the port and not the model. `/readyz` reflects real
+# model health and reports arch_list + device_capability in its 503 body, so
+# the next occurrence of that class names its own cause.
+#
+# Deliberately NOT a periodic GPU call: the broker idle-shuts-down workers, so
+# a healthcheck touching the GPU every 30s would pin VRAM forever. Self-test
+# ONCE at startup, then latch on the first inference failure.
+#
+# whisperx note: the startup self-test runs 1s of SILENCE through the real ASR
+# path rather than just poking torch. CTranslate2 (the engine) and torch are
+# SEPARATE CUDA stacks here -- ct2 4.8.0 already ran on sm_120 while torch
+# could not -- so a torch-only probe would have passed during the outage and
+# proved nothing about transcription.
+_MODEL_OK: bool = False
+_MODEL_ERR: str | None = None
+
+
+def _mark_model_broken(e: BaseException) -> None:
+    global _MODEL_OK, _MODEL_ERR
+    _MODEL_OK = False
+    _MODEL_ERR = f"{type(e).__name__}: {e}"
+    log.error(f"model marked UNHEALTHY: {_MODEL_ERR}")
+
+
+try:
+    import numpy as _np
+    _asr_model.transcribe(_np.zeros(16000, dtype=_np.float32), batch_size=1)
+    _MODEL_OK = True
+    log.info("startup self-test PASSED — ASR executes on this device")
+except Exception as _e:  # noqa: BLE001
+    _mark_model_broken(_e)
+    log.error("startup self-test FAILED — /readyz will report 503")
+
+
+@app.get("/readyz")
+def readyz():
+    """Readiness — 503 unless the ASR model has actually executed here."""
+    import torch as _t
+    if _MODEL_OK:
+        return {"status": "ok", "compute_type": COMPUTE_TYPE,
+                "arch_list": _t.cuda.get_arch_list()}
+    return JSONResponse(
+        status_code=503,
+        content={"status": "unhealthy", "error": _MODEL_ERR,
+                 "compute_type": COMPUTE_TYPE,
+                 "arch_list": _t.cuda.get_arch_list(),
+                 "device_capability": list(_t.cuda.get_device_capability())
+                 if _t.cuda.is_available() else None},
     )
