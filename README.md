@@ -92,9 +92,9 @@ Defined in [`config/roles.yaml`](config/roles.yaml). Each role declares its imag
 
 | Role | Port | Image | Loaded | Peak | Idle | Policy |
 |---|---|---|---|---|---|---|
-| `embed` | 8081 | `gpu-broker/tei-embed:0.1.0` | 1.2 GiB | +0.4 GiB | 300s | co-resident with `rerank` |
-| `rerank` | 8082 | `gpu-broker/bge-reranker:0.1.0` | 1.2 GiB | +0.3 GiB | 300s | co-resident with `embed`, implies `embed` |
-| `transcribe` | 8083 | `gpu-broker/whisperx-server:0.1.0` | 0 (lazy) | 5.8 GiB | 30s | `evict_on_acquire: [rerank]`, `batch_size=4` pinned |
+| `embed` | 8081 | `gpu-broker/tei-embed:0.2.0` | 1.2 GiB | +0.4 GiB | 300s | co-resident with `rerank` |
+| `rerank` | 8082 | `gpu-broker/bge-reranker:0.2.0` | 1.2 GiB | +0.3 GiB | 300s | co-resident with `embed`, implies `embed` |
+| `transcribe` | 8083 | `gpu-broker/whisperx-server:0.2.0` | 0 (lazy) | 5.8 GiB | 30s | `evict_on_acquire: [rerank]`, `batch_size=4` pinned |
 | `llm` | 8084 | placeholder | 5.0 GiB | +1.5 GiB | 600s | `evict_on_acquire: [rerank, embed, transcribe]`, `enabled: false` |
 
 **Semantics:**
@@ -183,7 +183,7 @@ systemctl --user restart gpu-broker.service
 
 # Rebuild a worker image
 cd containers/whisperx-server
-docker build -t gpu-broker/whisperx-server:0.1.0 .
+docker build -t gpu-broker/whisperx-server:0.2.0 .
 # → next /acquire transcribe picks up the new image (broker checks image digest on start)
 # → currently-loaded transcribe must be evicted first (it's still running the old image)
 curl -X POST http://127.0.0.1:8090/admin/unpin/transcribe  # if pinned
@@ -198,7 +198,7 @@ docker stop gpu-broker-transcribe                          # forces cold-restart
 |---|---|
 | Broker code | `/opt/brain/src/gpu-broker/` |
 | Broker venv | `/opt/fast/venvs/gpu-broker/` (only `fastapi`, `uvicorn`, `docker`, `pydantic`, `PyYAML`, `httpx`) |
-| Worker images | local Docker, tagged `gpu-broker/{tei-embed,bge-reranker,whisperx-server}:0.1.0` |
+| Worker images | local Docker, tagged `gpu-broker/{tei-embed,bge-reranker,whisperx-server}:0.2.0` |
 | Config | `config/roles.yaml` (edit + restart broker to apply) |
 | Systemd unit | `~/.config/systemd/user/gpu-broker.service` |
 | Env file | `/opt/brain/repo/env/.env` (HF_TOKEN passes through to worker containers) |
@@ -215,16 +215,16 @@ To add a new role:
 1. **Measure first.** Run the candidate model in isolation under `nvidia-smi` polling. Capture loaded VRAM, peak activation under realistic load, and cold-start time. The 2026-05-28 Phase 1 measurements (planning project file) are the template — without these numbers, eviction policy is guesswork.
 
 2. **Write the Dockerfile** under `containers/<role>/`. Conventions:
-   - Base on `nvidia/cuda:11.8.0-runtime-ubuntu22.04` (Pascal-compat). Use `cudnn8-runtime` ONLY if the model linker needs it (`ctranslate2`, some `whisperx` versions). cuDNN8 base is ~3.4 GB bigger.
-   - **Don't strip nvidia cu12 wheels blindly.** ctranslate2 4.5+ dlopens `libcublasLt.so.12` at encode-time. Stripping `nvidia-cublas-cu12` causes exit-139 SIGSEGV on first inference call (not at health-check time — `/healthz` will pass). The Phase 2.5 Dockerfile strip list specifically keeps `nvidia-cublas-cu12` and `nvidia-cudnn-cu12`.
+   - Base on `nvidia/cuda:12.8.1-runtime-ubuntu22.04`. (Was `11.8.0-runtime` for Pascal; **that pin is retired** — see *Blackwell / sm_120* below.) Use `12.8.1-cudnn-runtime` only if the model linker needs cuDNN (`ctranslate2`, some `whisperx` versions); it also ships cuBLAS 12 natively, which removes the old bolt-on cu12 handling entirely.
+   - **Do NOT strip nvidia cu12 wheels at all on a cu12x base.** ⚠️ **The Phase 2.5 strip list was REMOVED from all three Dockerfiles on 2026-08-28 and must not be reinstated.** It existed because the base was cu11 and torch linked cu11 for everything except cuDNN/cuBLAS; under `torch 2.7.1+cu128` those siblings are exactly the libs torch links against, so stripping them breaks the image at import. The historical hazard it guarded still illustrates the general rule: ctranslate2 4.5+ dlopens `libcublasLt.so.12` at encode-time, and stripping it caused exit-139 SIGSEGV on the first inference call — **not** at health-check time, because `/healthz` passes regardless.
    - **Register cu12 .so files with ldconfig** (`/etc/ld.so.conf.d/nvidia-cu12.conf`). Pip's `nvidia/*/lib/` layout is not on the default loader path.
    - Bake model weights into the image (fp16 single-format only, NOT the full HF cache). Set `HF_HUB_OFFLINE=1` at runtime so the container can't drift to a network fetch.
-   - Expose `/healthz` and the inference endpoint. `EXPOSE` the chosen port.
+   - Expose `/healthz`, **`/readyz`**, and the inference endpoint. `EXPOSE` the chosen port. `/healthz` is liveness only; **`/readyz` must exercise the model** (self-test once at startup, then latch on the first inference failure) and the `HEALTHCHECK` must point at `/readyz`. Added 2026-08-28 after the embed container reported `health=healthy` with 0 restarts while failing **100%** of requests — its healthcheck probed the port, not the model, so nothing alerted.
    - Add labels: `gpu-broker.role=<role>` and `gpu-broker.image-digest=<digest>` (broker uses these for rediscovery).
 
-3. **Add the role to `config/roles.yaml`** with measured numbers. Set `enabled: false` initially while you debug; flip to `true` once `/healthz` + a real inference call both pass under the broker.
+3. **Add the role to `config/roles.yaml`** with measured numbers, **and set `gpu_selector`** (a card-name substring or full UUID — never an index). Set `enabled: false` initially while you debug; flip to `true` once **`/readyz`** + a real inference call both pass under the broker. An unpinned role is only safe while exactly one card is installed, and the broker now ERRORs at startup if a second card appears while enabled roles lack a selector.
 
-4. **Smoke test through the broker.** `/healthz`-only smoke is not sufficient (Phase 2.5 lesson) — `acquire → /infer → release` is the minimum bar.
+4. **Smoke test through the broker.** `/healthz`-only smoke is not sufficient (Phase 2.5 lesson, re-confirmed hard on 2026-08-27) — `acquire → /infer → release` is the minimum bar.
 
 ---
 
@@ -244,7 +244,11 @@ To add a new role:
 
 **Broker restart loses my handle** — by design. Worker containers survive (`KillMode=process`), but the broker's in-memory `active_handles` ledger resets to 0. Consumers must re-acquire. Localhost-only deployment makes this cheap (cold-acquire is millisecond-scale on a pinned/loaded worker).
 
-**Pascal GPU + `float16`/`int8_float16`** — CTranslate2 rejects these on Pascal. Whisperx images use `compute_type=int8`. Lifts on Ampere+ (RTX 30/40/50 series) — see [Sunset criteria](#sunset-criteria).
+**Pascal GPU + `float16`/`int8_float16`** — ✅ **RESOLVED 2026-08-28.** CTranslate2 rejected these on Pascal, so whisperx ran `compute_type=int8`; the 1070 is gone and the images now use **`float16`**. Verified before the rebuild by probing ct2 4.8.0 *inside the old image*: it already saw the 5060 Ti and reported `float16`/`bfloat16` among its CUDA compute types — **ct2 was never the sm_120 blocker, torch was.**
+
+**Blackwell / `sm_120` (RTX 50-series)** — a `cu118` torch tops out at `sm_90` and every GPU call dies with `no kernel image is available for execution on the device`. All three images are on `torch==2.7.1+cu128`, whose arch list spans `sm_75…sm_120` and therefore covers a 3090 (`sm_86`) and a 5060 Ti (`sm_120`) with one wheel. Check with `torch.cuda.get_arch_list()` against `nvidia-smi --query-gpu=compute_cap`.
+
+**pyannote 3.3.2 + torch ≥ 2.6** — torch 2.6 flipped `torch.load(weights_only)` to `True` and pyannote's legacy pickles no longer load. Handled by `containers/whisperx-server/torch_compat.py`; read its docstring before touching it, especially the note that a retry against an already-consumed `fsspec` handle fails with an error describing the *data* rather than the retry.
 
 ---
 
@@ -314,7 +318,7 @@ roles:
 **What becomes dormant:**
 
 - `policy.py` eviction engine — code stays, paths just stop firing because no role declares `evict_on_acquire`
-- Pascal `compute_type=int8` workarounds in `containers/whisperx-server/`
+- ~~Pascal `compute_type=int8` workarounds in `containers/whisperx-server/`~~ — retired 2026-08-28 (now `float16`)
 - The `evict_on_acquire: [rerank]` doctrine baked into `/transcribe` SKILL.md (already abstracted by the broker, so callers don't need updates)
 
 **Reactivation triggers** (if eviction ever needs to come back):
