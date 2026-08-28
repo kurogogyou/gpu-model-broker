@@ -21,6 +21,7 @@ from typing import Iterable
 
 from .config import BrokerConfig, RoleConfig
 from .docker_mgr import DockerManager, WorkerHandle
+from .gpu_ledger import GpuBudget, GpuLedgerError, resolve_placement
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ class Worker:
     handle: WorkerHandle
     last_request_at: float
     idle_shutdown_at: float | None  # epoch seconds; None = never (always-on or pinned)
+    # Which physical GPU this worker's VRAM is charged to. Set at add_worker()
+    # from the same resolution docker_mgr uses to pin the container, so the
+    # ledger charge and the actual placement cannot disagree.
+    gpu_uuid: str | None = None
 
     @property
     def endpoint(self) -> str:
@@ -51,6 +56,8 @@ class ClientHandle:
 class State:
     cfg: BrokerConfig
     docker: DockerManager
+    # uuid -> GpuBudget, resolved from nvidia-smi + cfg.gpu.cards at startup.
+    gpu_budgets: dict[str, GpuBudget] = field(default_factory=dict)
     # role -> Worker (only loaded workers; stopped ones aren't tracked here)
     workers: dict[str, Worker] = field(default_factory=dict)
     # handle_id -> ClientHandle
@@ -69,14 +76,54 @@ class State:
     def role_has_active_holds(self, role: str) -> bool:
         return any(h.role == role for h in self.handles.values())
 
-    def total_loaded_vram_mb(self) -> int:
-        return sum(w.cfg.loaded_mb for w in self.workers.values())
+    def total_loaded_vram_mb(self, gpu_uuid: str | None = None) -> int:
+        """loaded_mb of resident workers, optionally scoped to one GPU."""
+        return sum(w.cfg.loaded_mb for w in self.workers.values()
+                   if gpu_uuid is None or w.gpu_uuid == gpu_uuid)
 
-    def vram_budget_free_mb(self) -> int:
-        """Budget-side view: total broker budget minus loaded_mb of resident workers.
+    def gpu_for_role(self, role: str) -> str:
+        """Which GPU `role` is charged against.
+
+        Delegates to gpu_ledger.resolve_placement — the SAME call docker_mgr
+        makes to pin the container — so the VRAM charge and the physical
+        placement are one decision, not two that happen to agree.
+        """
+        return resolve_placement(
+            self.cfg.roles[role].gpu_selector,
+            [self._as_info(u) for u in self.gpu_budgets],
+            role=role,
+        )
+
+    def _as_info(self, uuid_: str):
+        from .gpu_ledger import GpuInfo
+        b = self.gpu_budgets[uuid_]
+        return GpuInfo(uuid=b.uuid, name=b.name, total_mb=b.total_mb)
+
+    def vram_budget_free_mb(self, gpu_uuid: str | None = None) -> int:
+        """Budget-side free VRAM on one GPU (or summed across all, for /status).
+
         Distinct from gpu_used_mb() which reflects the actual nvidia-smi reading
-        (includes host overhead + activation peaks)."""
-        return self.cfg.gpu.broker_budget_mb - self.total_loaded_vram_mb()
+        (includes host overhead + activation peaks).
+
+        The summed form is a REPORTING convenience only — never schedule against
+        it. Free VRAM does not pool across cards: 8 GiB free on each of two cards
+        does not fit a 12 GiB model.
+        """
+        if gpu_uuid is not None:
+            b = self.gpu_budgets.get(gpu_uuid)
+            if b is None:
+                raise GpuLedgerError(f"no ledger entry for GPU {gpu_uuid}")
+            return b.budget_mb - self.total_loaded_vram_mb(gpu_uuid)
+        return sum(b.budget_mb - self.total_loaded_vram_mb(u)
+                   for u, b in self.gpu_budgets.items())
+
+    def budget_total_mb(self) -> int:
+        """Sum of per-GPU budgets. Reporting only — see vram_budget_free_mb."""
+        return sum(b.budget_mb for b in self.gpu_budgets.values())
+
+    def gpu_total_mb(self) -> int:
+        """Sum of MEASURED card totals. Reporting only."""
+        return sum(b.total_mb for b in self.gpu_budgets.values())
 
     # ---------- mutations (must be called under self.lock) ----------
 
@@ -89,7 +136,7 @@ class State:
             else None
         )
         w = Worker(role=role, cfg=cfg, handle=handle, last_request_at=now,
-                   idle_shutdown_at=shutdown_at)
+                   idle_shutdown_at=shutdown_at, gpu_uuid=self.gpu_for_role(role))
         self.workers[role] = w
         return w
 

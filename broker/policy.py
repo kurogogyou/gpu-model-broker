@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from .gpu_ledger import GpuLedgerError
 from .state import State
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,7 @@ class PolicyPlan:
     feasible: bool = True
     infeasible_reason: str | None = None
     free_mb_after_evict: int | None = None  # what budget will look like once evictions land
+    gpu_uuid: str | None = None  # which card this acquire is charged against
 
 
 def plan_acquire(state: State, role: str) -> PolicyPlan:
@@ -54,12 +56,25 @@ def plan_acquire(state: State, role: str) -> PolicyPlan:
         plan.to_warm_implies, plan.to_touch_implies = _split_implies(state, cfg.implies)
         return plan
 
+    # Which card this role is charged against. Every budget decision below is
+    # scoped to it: VRAM does not pool across GPUs, so evicting a worker on the
+    # other card frees nothing that helps this acquire.
+    try:
+        target_gpu = state.gpu_for_role(role)
+    except GpuLedgerError as exc:
+        return PolicyPlan(role=role, feasible=False, infeasible_reason=str(exc))
+    plan.gpu_uuid = target_gpu
+
     # Hard evictions per role config (evict_on_acquire). Pin protection applies.
+    # Cross-GPU entries stay in the plan — evict_on_acquire is a contractual
+    # rule about co-residency, not a VRAM optimisation — but only same-GPU
+    # evictions count toward the freed budget.
     plan.to_evict.extend(_filter_evictable(state, cfg.evict_on_acquire))
 
     # Compute free budget after the hard evictions.
-    freed = sum(state.cfg.roles[r].loaded_mb for r in plan.to_evict)
-    free_after_evict = state.vram_budget_free_mb() + freed
+    freed = sum(state.cfg.roles[r].loaded_mb for r in plan.to_evict
+                if _worker_gpu(state, r) == target_gpu)
+    free_after_evict = state.vram_budget_free_mb(target_gpu) + freed
 
     needed = cfg.loaded_mb
     if free_after_evict >= needed:
@@ -68,7 +83,8 @@ def plan_acquire(state: State, role: str) -> PolicyPlan:
         return plan
 
     # Need more — try LRU eviction of other non-pinned, no-active-holds workers.
-    extra = _lru_eviction_candidates(state, exclude=set(plan.to_evict) | {role})
+    extra = _lru_eviction_candidates(state, exclude=set(plan.to_evict) | {role},
+                                     gpu_uuid=target_gpu)
     for victim in extra:
         if free_after_evict >= needed:
             break
@@ -77,9 +93,11 @@ def plan_acquire(state: State, role: str) -> PolicyPlan:
 
     if free_after_evict < needed:
         plan.feasible = False
+        gpu = state.gpu_budgets.get(target_gpu)
         plan.infeasible_reason = (
-            f"would need {needed - free_after_evict} MiB more even after "
-            f"evicting {plan.to_evict or 'nothing evictable'}"
+            f"would need {needed - free_after_evict} MiB more on "
+            f"{gpu.name if gpu else target_gpu} (budget {gpu.budget_mb if gpu else '?'} "
+            f"MiB) even after evicting {plan.to_evict or 'nothing evictable'}"
         )
         plan.free_mb_after_evict = free_after_evict
         return plan
@@ -104,14 +122,24 @@ def _filter_evictable(state: State, roles: list[str]) -> list[str]:
     return out
 
 
-def _lru_eviction_candidates(state: State, exclude: set[str]) -> list[str]:
+def _worker_gpu(state: State, role: str) -> str | None:
+    w = state.workers.get(role)
+    return w.gpu_uuid if w else None
+
+
+def _lru_eviction_candidates(state: State, exclude: set[str],
+                             gpu_uuid: str | None = None) -> list[str]:
     """Roles sorted by last_request_at ascending (oldest first), excluding
-    the given set, pinned roles, and roles with active client holds."""
+    the given set, pinned roles, and roles with active client holds.
+
+    Scoped to `gpu_uuid` when given: a worker on another card is not an
+    eviction candidate, because stopping it frees no VRAM on the target card."""
     candidates = [
         w for w in state.workers.values()
         if w.role not in exclude
         and w.role not in state.pinned_roles
         and not state.role_has_active_holds(w.role)
+        and (gpu_uuid is None or w.gpu_uuid == gpu_uuid)
     ]
     candidates.sort(key=lambda w: w.last_request_at)
     return [w.role for w in candidates]

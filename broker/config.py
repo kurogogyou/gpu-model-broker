@@ -55,13 +55,26 @@ class RoleConfig(BaseModel):
     health_path: str = "/healthz"
 
 
-class GpuConfig(BaseModel):
-    total_mb: int = Field(ge=1)
+class GpuCardConfig(BaseModel):
+    """Policy for ONE card in the ledger. See broker/gpu_ledger.py.
+
+    `total_mb` is deliberately absent — it is measured from the card at startup,
+    never configured. A hand-maintained total is what let `gpu.total_mb` sit at
+    24576 (a 3090 that had been swapped out) against an installed 16311 MiB
+    5060 Ti on 2026-08-27, with nothing detecting it.
+    """
+    # Driver's own reserve + fragmentation headroom. Not measurable: the driver
+    # half is (~460 MiB, near-constant across cards) but the headroom half is a
+    # judgement call. Absolute, not proportional — it does not shrink on a
+    # smaller card.
     reserved_for_host_mb: int = Field(ge=0)
 
-    @property
-    def broker_budget_mb(self) -> int:
-        return self.total_mb - self.reserved_for_host_mb
+
+class GpuConfig(BaseModel):
+    """Ledger of cards this machine may have; entries with no installed card are
+    inactive. Keyed like `RoleConfig.gpu_selector`: full UUID or case-insensitive
+    substring of the card NAME, never an index."""
+    cards: dict[str, GpuCardConfig] = Field(min_length=1)
 
 
 class BrokerConfig(BaseModel):

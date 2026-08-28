@@ -58,6 +58,12 @@
 roles:
 
   embed:
+    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
+    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
+    # card is installed: a selector that matches nothing falls back to
+    # the SOLE installed card (gpu_ledger.resolve_placement), so this
+    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
+    gpu_selector: "5060 Ti"
     image: gpu-broker/tei-embed:0.2.0
     port: 8081
     loaded_mb: 1200
@@ -67,6 +73,12 @@ roles:
     enabled: true
 
   rerank:
+    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
+    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
+    # card is installed: a selector that matches nothing falls back to
+    # the SOLE installed card (gpu_ledger.resolve_placement), so this
+    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
+    gpu_selector: "5060 Ti"
     image: gpu-broker/bge-reranker:0.2.0
     port: 8082
     loaded_mb: 1200
@@ -77,6 +89,12 @@ roles:
     enabled: true
 
   transcribe:
+    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
+    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
+    # card is installed: a selector that matches nothing falls back to
+    # the SOLE installed card (gpu_ledger.resolve_placement), so this
+    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
+    gpu_selector: "5060 Ti"
     image: gpu-broker/whisperx-server:0.1.0
     port: 8083
     loaded_mb: 0            # lazy on /acquire; no always-on residency
@@ -224,36 +242,79 @@ roles:
 
 # Host-level constraints
 gpu:
-  total_mb: 24576
-  reserved_for_host_mb: 1024
-  # Was 8192 / 700 for the GTX 1070. The old 700 MiB was justified as "X server
-  # / desktop overhead" -- that justification is now void: the display runs on
-  # the Haswell iGPU and X does not touch this card at all (idle 1 MiB / 27 W,
-  # AutoAddGPU off). What remains is ~400 MiB driver reserve plus a per-process
-  # CUDA context of ~300 MiB, charged once per resident worker. 1024 covers the
-  # driver reserve with fragmentation headroom.
+  # PER-GPU LEDGER (2026-08-28). Replaces the old global `total_mb` /
+  # `reserved_for_host_mb` pair.
   #
-  # Effective broker budget: 24576 - 1024 = 23552 MiB (was 7492).
+  # Why it changed: `total_mb` was a hand-maintained number nobody reconciled
+  # against the hardware. On 2026-08-27 it still read 24576 -- an RTX 3090 that
+  # had been swapped out -- while the installed card was a 16311 MiB RTX 5060
+  # Ti. Nothing detected it for the life of the swap, and /status made it worse
+  # by reporting gpu_total_mb from THIS FILE while reporting gpu_used_mb from
+  # nvidia-smi in the adjacent field, so the endpoint that should have exposed
+  # the drift confirmed it instead.
   #
-  # NOTE: usable VRAM is ~23.3 GiB, not 24 -- plan against ~23 GiB and leave the
-  # last GiB for fragmentation. Do not size a role to the full budget.
+  # The split now enforced:
+  #   MEASURED from the card  -> total_mb, uuid, name   (NOT configurable here)
+  #   POLICY from this file   -> reserved_for_host_mb
   #
-  # RE-MEASURED ON SCULLY 2026-08-27 -- value CONFIRMED, do not lower it.
-  # The host moved to the AM5 box (B850M-A, AMD iGPU drives both monitors via
-  # BIOS Primary Display = IGFX; the "Haswell iGPU" above refers to FATEBURN).
-  # It is tempting to cut this now that the display tax is provably zero, but
-  # that saving was ALREADY taken when this went from 700 -> 1024: the 1024 is
-  # driver reserve + fragmentation headroom, NOT desktop overhead.
+  # There is deliberately no `total_mb` key. A config file cannot have an
+  # opinion about how much VRAM is soldered to a board; letting it have one is
+  # precisely how the drift above happened.
   #
-  # Measured idle, nothing resident:  total 24576 | used 15 | free 24110 MiB
-  #   -> 24576 - 15 - 24110 = 451 MiB the driver holds back and never reports
-  #      as "used". That is the "~400 MiB driver reserve" above, confirmed.
-  #   -> 15 MiB is the entire cost of the desktop being elsewhere. Already
-  #      accounted for; there is nothing left to reclaim from it.
-  # Trimming 1024 -> ~640 would recover ~384 MiB, unlock no new model tier, and
-  # spend exactly the fragmentation headroom the NOTE above asks for.
-  #
-  # Full reasoning + the soak that produced these numbers:
-  # Mind/projects/active/self-hosted-brain-sovereignty/decisions.md
-  #   § "acpi_enforce_resources=lax makes SMBus RGB tooling a RAM-corruption
-  #      risk on Scully (2026-08-27)" -> subsection "3090 acceptance re-run".
+  # Keys are matched like `gpu_selector`: a full UUID, or a case-insensitive
+  # substring of the card NAME. Never an index. An entry whose card is not
+  # installed is simply INACTIVE -- which is how the 3090 entry sits dormant
+  # below while the 5060 Ti is in the box, and why swapping the cards back
+  # requires no edit to this file. An installed card with NO entry is a hard
+  # startup failure, not a default: a card the broker cannot budget is a card
+  # it will over-commit.
+  cards:
+
+    "3090":
+      reserved_for_host_mb: 1024
+      # Was 8192 / 700 for the GTX 1070. The old 700 MiB was justified as
+      # "X server / desktop overhead" -- that justification is void: the
+      # display runs on the iGPU and X does not touch this card at all (idle
+      # 1 MiB / 27 W, AutoAddGPU off). What remains is ~400 MiB driver reserve
+      # plus a per-process CUDA context of ~300 MiB, charged once per resident
+      # worker. 1024 covers the driver reserve with fragmentation headroom.
+      #
+      # Effective budget when installed: 24576 - 1024 = 23552 MiB (was 7492).
+      # Usable VRAM is ~23.3 GiB, not 24 -- plan against ~23 GiB and leave the
+      # last GiB for fragmentation. Do not size a role to the full budget.
+      #
+      # RE-MEASURED ON SCULLY 2026-08-27 -- value CONFIRMED, do not lower it.
+      # It is tempting to cut this now that the display tax is provably zero,
+      # but that saving was ALREADY taken when this went 700 -> 1024: the 1024
+      # is driver reserve + fragmentation headroom, NOT desktop overhead.
+      #
+      # Measured idle, nothing resident:  total 24576 | used 15 | free 24110
+      #   -> 24576 - 15 - 24110 = 451 MiB the driver holds back and never
+      #      reports as "used". That is the "~400 MiB driver reserve",
+      #      confirmed.
+      #   -> 15 MiB is the entire cost of the desktop being elsewhere. Already
+      #      accounted for; there is nothing left to reclaim from it.
+      # Trimming 1024 -> ~640 would recover ~384 MiB, unlock no new model tier,
+      # and spend exactly the fragmentation headroom asked for above.
+      #
+      # Full reasoning + the soak that produced these numbers:
+      # Mind/projects/active/self-hosted-brain-sovereignty/decisions.md
+      #   § "acpi_enforce_resources=lax makes SMBus RGB tooling a RAM-corruption
+      #      risk on Scully (2026-08-27)" -> subsection "3090 acceptance re-run".
+
+    "5060 Ti":
+      reserved_for_host_mb: 1024
+      # Measured the same way on 2026-08-27, idle:
+      #   total 16311 | driver holds back 16311 - used - free = 462 MiB
+      # Within 11 MiB of the 3090's 451, which is the expected result: the
+      # driver reserve is a near-constant, not a proportion of card size. The
+      # same 1024 policy therefore carries -- ~460 driver + ~560 fragmentation
+      # headroom -- because headroom is ABSOLUTE, not proportional. It does not
+      # shrink just because the card is smaller.
+      #
+      # Effective budget when installed: 16311 - 1024 = 15287 MiB.
+      # Consequence worth knowing before it surprises anyone: llm_large
+      # (21000 + 2000) does not fit this card at all, and llm_small
+      # (9800 + 1200) fits only if the encoders are not co-resident
+      # (1600 + 1500 + 5800 = 8900). Both llm roles pin gpu_selector: 3090,
+      # so today they refuse to start here rather than OOM -- which is correct.

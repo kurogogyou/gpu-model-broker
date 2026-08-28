@@ -13,6 +13,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+from .gpu_ledger import nvidia_inventory, resolve_placement
+
 # Interface worker container ports are published on. Loopback by default --
 # see the note at the ports= kwarg in start_worker(). Override only once an
 # authenticated path (reverse proxy / WireGuard) fronts the workers.
@@ -83,22 +85,12 @@ class DockerManager:
     # ---------- GPU affinity ----------
 
     @staticmethod
-    def _nvidia_inventory() -> list[tuple[str, str]]:
-        """[(uuid, name), ...] from nvidia-smi. Empty list if it can't be read."""
-        try:
-            out = subprocess.run(
-                ["nvidia-smi", "--query-gpu=uuid,name", "--format=csv,noheader"],
-                capture_output=True, text=True, timeout=15, check=True,
-            ).stdout
-        except Exception as exc:  # noqa: BLE001 - any failure means "unknown"
-            log.warning("nvidia-smi inventory failed (%s); cannot pin by name", exc)
-            return []
-        rows = []
-        for line in out.strip().splitlines():
-            parts = [p.strip() for p in line.split(",", 1)]
-            if len(parts) == 2 and parts[0]:
-                rows.append((parts[0], parts[1]))
-        return rows
+    def _nvidia_inventory():
+        """Installed GPUs. Delegates to gpu_ledger so that pinning and VRAM
+        budgeting resolve selectors through ONE implementation — if these two
+        ever disagreed, a role would be charged to one card and placed on
+        another."""
+        return nvidia_inventory()
 
     def _device_requests_for(self, role: str, cfg: RoleConfig):
         """Build the DeviceRequest list, honouring `gpu_selector` if set.
@@ -110,32 +102,27 @@ class DockerManager:
         test. Selecting by UUID is immune to slot moves and enumeration order.
         """
         sel = cfg.gpu_selector
-        if not sel:
-            return [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
-
         inventory = self._nvidia_inventory()
         if not inventory:
             raise RuntimeError(
-                f"role={role} pins gpu_selector={sel!r} but the GPU inventory "
-                f"could not be read. Refusing to fall back to all-GPUs: that is "
-                f"how work lands on the wrong card silently."
+                f"role={role} cannot be placed: the GPU inventory could not be "
+                f"read. Refusing to fall back to all-GPUs -- that is how work "
+                f"lands on the wrong card silently."
             )
 
-        # exact UUID first, then case-insensitive name substring
-        matches = [u for u, _ in inventory if u == sel]
-        if not matches:
-            matches = [u for u, n in inventory if sel.lower() in n.lower()]
+        # Unpinned + exactly one card is the historical count=-1 case. Keep it:
+        # it is proven, and handing the sole GPU to the container is identical
+        # in effect to naming it.
+        if not sel and len(inventory) == 1:
+            return [docker.types.DeviceRequest(count=-1, capabilities=[["gpu"]])]
 
-        if len(matches) != 1:
-            avail = ", ".join(f"{n} ({u})" for u, n in inventory)
-            raise RuntimeError(
-                f"role={role} gpu_selector={sel!r} matched {len(matches)} GPUs; "
-                f"need exactly 1. Installed: {avail}"
-            )
-
-        log.info("role=%s pinned to GPU %s (selector=%r)", role, matches[0], sel)
+        # Everything else -- pinned, or unpinned on a multi-GPU box -- goes
+        # through the shared decision, which raises on genuine ambiguity and
+        # falls back only when one card is the sole option.
+        uuid_ = resolve_placement(sel, inventory, role=role)
+        log.info("role=%s placed on GPU %s (selector=%r)", role, uuid_, sel)
         return [docker.types.DeviceRequest(
-            device_ids=[matches[0]], capabilities=[["gpu"]]
+            device_ids=[uuid_], capabilities=[["gpu"]]
         )]
 
     # ---------- lifecycle ----------

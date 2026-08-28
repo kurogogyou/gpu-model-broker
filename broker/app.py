@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__, config, observability, policy
 from .docker_mgr import DockerManager
+from . import gpu_ledger
 from .state import State, candidates_to_stop_for_idle
 
 logging.basicConfig(
@@ -81,12 +82,30 @@ class WorkerStatus(BaseModel):
     active_handles: int
 
 
+class GpuStatus(BaseModel):
+    """Per-card view. `total_mb` is MEASURED from the card, never configured —
+    the previous global `gpu_total_mb` was read from config and sat at 24576 on
+    a 16311 MiB card with nothing detecting it."""
+    uuid: str
+    name: str
+    total_mb: int             # measured
+    reserved_for_host_mb: int  # policy
+    budget_total_mb: int
+    budget_free_mb: int
+    resident_roles: list[str]
+
+
 class StatusResponse(BaseModel):
     broker_version: str
     gpu_used_mb: int
     gpu_total_mb: int
     budget_free_mb: int
     budget_total_mb: int
+    # Per-card breakdown. The four scalars above are SUMS across cards, kept for
+    # backward compatibility and reporting only — never schedule against them.
+    # Free VRAM does not pool: 8 GiB free on each of two cards does not fit a
+    # 12 GiB model. Read `gpus` for anything that matters.
+    gpus: list[GpuStatus]
     workers: list[WorkerStatus]
     pinned_roles: list[str]
     active_handles: int
@@ -97,7 +116,28 @@ class StatusResponse(BaseModel):
 def _build_state() -> State:
     cfg = config.load()
     docker_mgr = DockerManager(version=__version__)
-    state = State(cfg=cfg, docker=docker_mgr)
+    # Reconcile the ledger against the hardware BEFORE anything can schedule.
+    # Raises rather than guessing: an installed card with no ledger entry, or a
+    # ledger key matching two cards, is a config decision, not a default.
+    inventory = gpu_ledger.nvidia_inventory()
+    budgets = gpu_ledger.resolve(cfg.gpu.cards, inventory)
+    state = State(cfg=cfg, docker=docker_mgr, gpu_budgets=budgets)
+
+    # Fail LOUD and EARLY on unpinned roles once a second card appears. Without
+    # this the broker starts clean and every affected role dies at its first
+    # /acquire -- which, for an encoder the RAG path warms on demand, means the
+    # failure surfaces in a search hours later instead of in the boot log.
+    if len(budgets) > 1:
+        unpinned = [n for n, r in cfg.roles.items()
+                    if r.enabled and not r.gpu_selector]
+        if unpinned:
+            log.error(
+                "%d GPUs installed but these enabled roles have no gpu_selector "
+                "and will REFUSE to start: %s. Pin each to a card "
+                "(e.g. gpu_selector: \"5060 Ti\") — an unpinned role on a "
+                "multi-GPU box lets CUDA pick by index.",
+                len(budgets), ", ".join(sorted(unpinned)))
+
     state.rediscover_from_docker()
     return state
 
@@ -125,8 +165,13 @@ async def _lifespan(app: FastAPI):
     state = _build_state()
     app.state.broker = state
     sweep_task = asyncio.create_task(_idle_sweep_loop(state))
-    log.info("broker started version=%s budget=%d/%d MiB",
-             __version__, state.cfg.gpu.broker_budget_mb, state.cfg.gpu.total_mb)
+    for b in state.gpu_budgets.values():
+        log.info("GPU %s (%s): measured %d MiB, reserve %d, budget %d "
+                 "[ledger key %r]", b.name, b.uuid, b.total_mb,
+                 b.reserved_for_host_mb, b.budget_mb, b.ledger_key)
+    log.info("broker started version=%s budget=%d/%d MiB across %d GPU(s)",
+             __version__, state.budget_total_mb(), state.gpu_total_mb(),
+             len(state.gpu_budgets))
     try:
         yield
     finally:
@@ -217,7 +262,11 @@ async def acquire(req: AcquireRequest):
                 status_code=503,
                 detail=InfeasibleResponse(
                     reason=plan.infeasible_reason or "infeasible",
-                    free_mb=state.vram_budget_free_mb(),
+                    # Free VRAM on the TARGET card, not the cross-card sum —
+                    # reporting the sum here would show plenty free while
+                    # refusing the acquire, which is the pooling illusion.
+                    free_mb=(state.vram_budget_free_mb(plan.gpu_uuid)
+                             if plan.gpu_uuid else state.vram_budget_free_mb()),
                     would_need_evict=plan.to_evict,
                 ).model_dump(),
             )
@@ -313,9 +362,20 @@ async def get_status():
         return StatusResponse(
             broker_version=__version__,
             gpu_used_mb=observability.gpu_used_mb(),
-            gpu_total_mb=state.cfg.gpu.total_mb,
+            gpu_total_mb=state.gpu_total_mb(),
             budget_free_mb=state.vram_budget_free_mb(),
-            budget_total_mb=state.cfg.gpu.broker_budget_mb,
+            budget_total_mb=state.budget_total_mb(),
+            gpus=[
+                GpuStatus(
+                    uuid=b.uuid, name=b.name, total_mb=b.total_mb,
+                    reserved_for_host_mb=b.reserved_for_host_mb,
+                    budget_total_mb=b.budget_mb,
+                    budget_free_mb=state.vram_budget_free_mb(u),
+                    resident_roles=sorted(w.role for w in state.workers.values()
+                                          if w.gpu_uuid == u),
+                )
+                for u, b in state.gpu_budgets.items()
+            ],
             workers=workers_out,
             pinned_roles=sorted(state.pinned_roles),
             active_handles=len(state.handles),
