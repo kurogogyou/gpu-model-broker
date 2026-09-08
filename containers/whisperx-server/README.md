@@ -6,20 +6,30 @@ for broker-managed lifecycle.
 ## Build
 
 ```
-# Without diarization (transcribe + align only)
-docker build -t gpu-broker/whisperx-server:0.1.0 containers/whisperx-server/
+# Standard build — WITH diarization. The BuildKit secret is mandatory.
+docker buildx build \
+  --secret id=hf_token,src=/home/mario/.config/gpu-broker/hf-token \
+  -t gpu-broker/whisperx-server:0.2.1 \
+  containers/whisperx-server/
 
-# With diarization (bakes pyannote/speaker-diarization-3.1)
-docker build \
-  --build-arg HF_TOKEN=hf_xxxxxxxxxxxx \
-  -t gpu-broker/whisperx-server:0.1.0 \
+# Transcribe + align only, no diarization — must be requested explicitly
+docker buildx build \
+  --build-arg WITH_DIARIZATION=0 \
+  -t gpu-broker/whisperx-server:0.2.1-noattr \
   containers/whisperx-server/
 ```
 
-The `HF_TOKEN` build arg is only used at build time to download the pyannote
-weights into the image cache. It is **not** persisted as an ENV in the
-running image — for diarization at runtime, pass `-e HF_TOKEN=...` to
-`docker run` (the broker does this from its configured secret store).
+⚠️ **`--build-arg HF_TOKEN=...` no longer does anything.** Phase 2.5 (2026-06-13)
+moved the token to a BuildKit `--mount=type=secret`, but this file kept
+documenting the build-arg form for eleven weeks. A stray build arg is ignored
+without error, so the build "succeeded" and produced an image with no pyannote
+weights — see the 2026-09-08 diagnosis. Both the missing secret and an empty
+cache after the bake are now hard build failures.
+
+The token is only used at build time to download the pyannote weights into the
+image cache. It is **not** persisted as an ENV in the running image — for
+diarization at runtime, pass `-e HF_TOKEN=...` to `docker run` (the broker does
+this from its configured secret store).
 
 Build prerequisites (once per HuggingFace account):
 

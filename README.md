@@ -182,8 +182,11 @@ systemctl --user restart gpu-broker.service
 # → active handles are reset to 0 (callers must re-acquire)
 
 # Rebuild a worker image
-cd containers/whisperx-server
-docker build -t gpu-broker/whisperx-server:0.2.0 .
+docker buildx build \
+  --secret id=hf_token,src=/home/mario/.config/gpu-broker/hf-token \
+  -t gpu-broker/whisperx-server:0.2.1 containers/whisperx-server/
+# → plain `docker build` without the secret is a BUILD FAILURE as of 2026-09-08.
+#   It used to succeed and quietly ship an image that could not diarize.
 # → next /acquire transcribe picks up the new image (broker checks image digest on start)
 # → currently-loaded transcribe must be evicted first (it's still running the old image)
 curl -X POST http://127.0.0.1:8090/admin/unpin/transcribe  # if pinned

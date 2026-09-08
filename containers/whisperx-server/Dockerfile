@@ -1,11 +1,17 @@
 # syntax=docker/dockerfile:1.7
 # whisperx-server — WhisperX large-v3 + pyannote diarization HTTP service.
 #
-# Build (BuildKit required for --secret):
+# Build — the --secret mount is MANDATORY unless you opt out explicitly.
+# There is exactly one correct build command; do not use `docker build` with a
+# --build-arg HF_TOKEN (Phase 2.5 moved to a BuildKit secret, and a stray
+# build-arg is silently ignored):
 #   docker buildx build \
 #     --secret id=hf_token,src=/home/mario/.config/gpu-broker/hf-token \
-#     -t gpu-broker/whisperx-server:0.1.0 \
+#     -t gpu-broker/whisperx-server:0.2.1 \
 #     containers/whisperx-server/
+# Transcribe+align only (no diarization), explicit:
+#   docker buildx build --build-arg WITH_DIARIZATION=0 \
+#     -t gpu-broker/whisperx-server:0.2.1-noattr containers/whisperx-server/
 #
 # Run:    docker run --rm --gpus all -p 8083:8083 \
 #             -e HF_TOKEN=hf_xxx \
@@ -109,15 +115,63 @@ print('alignment models cached: en, es')"
 # `docker history` and image-layer metadata) to BuildKit's `--mount=type=secret`,
 # which exposes the secret only at /run/secrets/hf_token during this single RUN
 # (tmpfs-backed; never persisted to image or history).
+# Phase 5 (2026-09-08): the `else echo` that used to sit here made a missing
+# secret a LOG LINE rather than a build failure, and image 0.2.0 shipped with no
+# pyannote weights as a result — every diarize=true request 500'd for eleven
+# days. A skipped capability must now be REQUESTED, never inferred from a
+# missing file. `--build-arg WITH_DIARIZATION=0` is the supported way to build
+# transcribe+align-only; anything else without the secret fails the build.
+#
+# Two further traps, both paid for:
+#   * torch_compat MUST be installed here too. Pipeline.from_pretrained loads
+#     the pyannote checkpoints through torch.load, which under torch 2.7
+#     defaults to weights_only=True and rejects them. The bake step was missing
+#     the shim the server has had since 2026-08-28.
+#   * BuildKit excludes secret CONTENTS from the layer cache key, so re-running
+#     an identical RUN with the secret now supplied would hit the cached
+#     no-weights layer. The ARG below is part of the cache key and this command
+#     text changed, so this rebuild misses cache — but if you ever edit this
+#     step again without changing its text, add --no-cache-filter.
+# pyannote does NOT use HF_HOME. `Pipeline.from_pretrained` defaults to
+# PYANNOTE_CACHE, falling back to ~/.cache/torch/pyannote — so the weights land
+# outside every cache dir this image otherwise configures, and any check that
+# looks in HF_HOME returns a false negative (cost one build cycle on
+# 2026-09-08). Pin it somewhere deliberate and inspectable, shared by the bake
+# below and by the running server.
+ENV PYANNOTE_CACHE=/models/pyannote-cache
+
+ARG WITH_DIARIZATION=1
 RUN --mount=type=secret,id=hf_token,target=/run/secrets/hf_token \
-    if [ -s /run/secrets/hf_token ]; then \
+    if [ "$WITH_DIARIZATION" = "0" ]; then \
+        echo "WITH_DIARIZATION=0 — skipping pyannote bake by explicit request" ; \
+    elif [ ! -s /run/secrets/hf_token ]; then \
+        echo "FATAL: hf_token BuildKit secret missing or empty." >&2 ; \
+        echo "  Build with:  docker buildx build --secret id=hf_token,src=/home/mario/.config/gpu-broker/hf-token -t gpu-broker/whisperx-server:<tag> ." >&2 ; \
+        echo "  Or opt out:  docker buildx build --build-arg WITH_DIARIZATION=0 ..." >&2 ; \
+        exit 1 ; \
+    else \
         HF_HUB_OFFLINE=0 HF_TOKEN="$(tr -d '\n\r' < /run/secrets/hf_token)" python3 -c "\
-import os; \
+import os, torch_compat; torch_compat.install(); \
 from pyannote.audio import Pipeline; \
 Pipeline.from_pretrained('pyannote/speaker-diarization-3.1', use_auth_token=os.environ['HF_TOKEN']); \
 print('pyannote/speaker-diarization-3.1 cached')" ; \
-    else \
-        echo 'hf_token secret not supplied at build time; diarization will fail at runtime' ; \
+    fi
+
+# Verify the bake actually landed — by RE-LOADING THE PIPELINE OFFLINE, which
+# is the exact thing the server does on the first diarize request. The step
+# above can print "cached" and produce nothing (a token that lost its gated-repo
+# grant still returns 200 on the API but 403 on the weights), and a file-
+# existence check only proves that the files a previous version of this check
+# knew about are present. Exercise the restore path instead of inspecting it.
+RUN if [ "$WITH_DIARIZATION" != "0" ]; then \
+        echo "--- pyannote cache contents ---" && \
+        find /models/pyannote-cache -maxdepth 2 -mindepth 1 2>/dev/null | sort && \
+        HF_HUB_OFFLINE=1 python3 -c "\
+import torch_compat; torch_compat.install(); \
+from pyannote.audio import Pipeline; \
+p = Pipeline.from_pretrained('pyannote/speaker-diarization-3.1'); \
+assert p is not None, 'pipeline is None'; \
+print('verified: pyannote pipeline instantiates OFFLINE from the baked cache')" ; \
     fi
 
 # Phase 2.5 (2026-06-13): audit HF + torch cache layouts so a future trim pass

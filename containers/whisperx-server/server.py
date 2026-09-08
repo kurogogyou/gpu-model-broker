@@ -75,15 +75,76 @@ def _get_align_model(language_code: str):
     return _align_cache[language_code]
 
 
+# --- Diarization capability probe (added 2026-09-08) -----------------------
+# The image can be built WITHOUT the pyannote weights: the Dockerfile bake step
+# was guarded on a BuildKit secret and downgraded a missing secret to an echo,
+# so 0.2.0 shipped with ASR weights only. With HF_HUB_OFFLINE=1 the runtime
+# cannot fetch them either, so every diarize=true request died ~60s in with an
+# opaque HTTP 500 (LocalEntryNotFoundError) — after paying a cold model load.
+#
+# Probe the cache at STARTUP instead, and answer diarize=true in milliseconds
+# when the answer is going to be no. This is a capability report, not a
+# liveness gate: transcribe+align-only is a supported build, so a missing
+# pipeline must not take the container down or fail /readyz.
+# All three repos, and the pyannote cache — NOT HF_HOME. pyannote's
+# Pipeline.from_pretrained defaults to PYANNOTE_CACHE (~/.cache/torch/pyannote
+# when unset), so a probe pointed at HF_HOME reports "missing" for weights that
+# are present and 503s requests that would have worked. The image pins
+# PYANNOTE_CACHE=/models/pyannote-cache so bake and runtime agree.
+_PYANNOTE_CACHE = os.environ.get("PYANNOTE_CACHE") or None
+_DIARIZE_REPOS = (
+    ("pyannote/speaker-diarization-3.1", "config.yaml"),
+    ("pyannote/segmentation-3.0", "pytorch_model.bin"),
+    ("pyannote/wespeaker-voxceleb-resnet34-LM", "pytorch_model.bin"),
+)
+_DIARIZE_AVAILABLE: bool = False
+_DIARIZE_ERR: str | None = None
+
+
+def _probe_diarization() -> None:
+    """Set _DIARIZE_AVAILABLE / _DIARIZE_ERR from cache + token state. No GPU."""
+    global _DIARIZE_AVAILABLE, _DIARIZE_ERR
+    if not os.environ.get("HF_TOKEN"):
+        _DIARIZE_ERR = ("HF_TOKEN env var not set in the container; pyannote "
+                        "refuses to instantiate without it. The broker passes it "
+                        "from its secret store — see gpu-broker docker_mgr.py.")
+        return
+    from huggingface_hub import try_to_load_from_cache
+
+    missing = [
+        f"{repo}:{fname}" for repo, fname in _DIARIZE_REPOS
+        if not isinstance(
+            try_to_load_from_cache(repo, fname, cache_dir=_PYANNOTE_CACHE), str
+        )
+    ]
+    if missing:
+        _DIARIZE_ERR = (
+            "diarization unavailable: pyannote weights missing from the image "
+            f"(not in {_PYANNOTE_CACHE or '~/.cache/torch/pyannote'}): "
+            + ", ".join(missing)
+            + ". HF_HUB_OFFLINE="
+            + os.environ.get("HF_HUB_OFFLINE", "0")
+            + " so they cannot be fetched at runtime. Rebuild the image WITH the "
+            "BuildKit secret: docker buildx build --secret "
+            "id=hf_token,src=/home/mario/.config/gpu-broker/hf-token ..."
+        )
+        return
+    _DIARIZE_AVAILABLE = True
+
+
+_probe_diarization()
+if _DIARIZE_AVAILABLE:
+    log.info("diarization available: pyannote weights present in cache")
+else:
+    log.warning("DIARIZATION UNAVAILABLE — %s", _DIARIZE_ERR)
+
+
 def _get_diarize_pipeline():
     global _diarize_pipeline
     if _diarize_pipeline is None:
+        if not _DIARIZE_AVAILABLE:
+            raise HTTPException(status_code=503, detail=_DIARIZE_ERR)
         hf_token = os.environ.get("HF_TOKEN")
-        if not hf_token:
-            raise HTTPException(
-                status_code=400,
-                detail="HF_TOKEN env var not set; diarization unavailable",
-            )
         log.info("Loading pyannote diarization pipeline")
         t0 = time.time()
         _diarize_pipeline = whisperx.DiarizationPipeline(
@@ -151,6 +212,8 @@ def health() -> dict:
         "vram_allocated_mb": _vram_mb(),
         "align_languages_loaded": sorted(_align_cache.keys()),
         "diarize_loaded": _diarize_pipeline is not None,
+        "diarize_available": _DIARIZE_AVAILABLE,
+        "diarize_error": _DIARIZE_ERR,
     }
 
 
@@ -161,6 +224,11 @@ def transcribe(req: TranscribeRequest) -> TranscribeResponse:
             status_code=400,
             detail=f"audio_path not found inside container: {req.audio_path}",
         )
+
+    # Refuse an impossible request in milliseconds rather than after a cold
+    # model load + a full transcription pass (2026-09-08: 57s to an opaque 500).
+    if req.diarize and not _DIARIZE_AVAILABLE:
+        raise HTTPException(status_code=503, detail=_DIARIZE_ERR)
 
     batch_size = req.batch_size if req.batch_size is not None else DEFAULT_BATCH_SIZE
     log.info(f"transcribe audio={req.audio_path} lang={req.language} batch={batch_size} align={req.align} diarize={req.diarize}")
@@ -274,7 +342,9 @@ def readyz():
     import torch as _t
     if _MODEL_OK:
         return {"status": "ok", "compute_type": COMPUTE_TYPE,
-                "arch_list": _t.cuda.get_arch_list()}
+                "arch_list": _t.cuda.get_arch_list(),
+                "diarize_available": _DIARIZE_AVAILABLE,
+                "diarize_error": _DIARIZE_ERR}
     return JSONResponse(
         status_code=503,
         content={"status": "unhealthy", "error": _MODEL_ERR,
