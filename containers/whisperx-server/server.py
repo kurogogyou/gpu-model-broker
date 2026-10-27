@@ -5,11 +5,14 @@ serves transcription requests over a small JSON API. Designed for
 broker-managed lifecycle: container starts → model loads → /healthz
 flips to ok → broker routes /transcribe requests here.
 
-Audio input is path-based: the caller passes a host path that's bind-
-mounted into the container (broker convention: mount /home/mario at the
-same path so paths just work for same-host callers). Multipart upload
-support is a v2 concern — gated on the 55places consumer waking up
-(currently paused per [[job-search-paused]]).
+Audio input, two ways, one pipeline:
+  POST /transcribe         JSON {"audio_path": ...}: a host path bind-mounted
+                           into the container (same-host callers).
+  POST /transcribe_upload  the media bytes as the raw request body, options as
+                           query parameters (callers on another host, reached
+                           over an SSH tunnel so /acquire still runs). The body
+                           is decoded straight to an array; nothing is written
+                           to disk, so there is no copy to clean up.
 
 Environment variables (all consumed at import or first-request time):
     WHISPERX_MODEL              model size (default: large-v3)
@@ -26,13 +29,19 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
+import threading
 import time
 from typing import Literal
 
+import numpy as np
 import torch
 import whisperx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
+from starlette.requests import ClientDisconnect
 
 MODEL_NAME = os.environ.get("WHISPERX_MODEL", "large-v3")
 COMPUTE_TYPE = os.environ.get("WHISPERX_COMPUTE_TYPE", "float16")
@@ -154,7 +163,7 @@ def _get_diarize_pipeline():
     return _diarize_pipeline
 
 
-app = FastAPI(title="whisperx-server", version="0.1.0")
+app = FastAPI(title="whisperx-server", version="0.3.0")
 
 
 class TranscribeRequest(BaseModel):
@@ -230,10 +239,103 @@ def transcribe(req: TranscribeRequest) -> TranscribeResponse:
     if req.diarize and not _DIARIZE_AVAILABLE:
         raise HTTPException(status_code=503, detail=_DIARIZE_ERR)
 
-    batch_size = req.batch_size if req.batch_size is not None else DEFAULT_BATCH_SIZE
-    log.info(f"transcribe audio={req.audio_path} lang={req.language} batch={batch_size} align={req.align} diarize={req.diarize}")
+    log.info(f"transcribe audio={req.audio_path}")
+    return _transcribe_impl(whisperx.load_audio(req.audio_path), req)
 
-    audio = whisperx.load_audio(req.audio_path)
+
+# --- Upload path (added 2026-10-27) ------------------------------------------
+# The path API forces the recording onto this host's disk, so every remote
+# transcription left a second copy of a real-name meeting here that nothing
+# pruned. The path is used exactly once -- whisperx.load_audio() turns it into
+# an array and every stage after it (ASR, align, diarize) takes the array -- so
+# the bytes can go through the same ffmpeg command over a pipe instead.
+#
+# _FFMPEG_DECODE is load_audio()'s own command with the file swapped for
+# pipe:0, and the array is built the same way. Checked 2026-10-27 on a real
+# recording: the original's audio stream, copied out with `-vn -c:a copy` and
+# piped through here, is BIT-IDENTICAL to load_audio() on the original file.
+# Re-encoding on the client (FLAC at 16 kHz) is not: off by up to 1 LSB, since
+# the client's ffmpeg 6.1 resamples differently from this image's 4.4. So
+# callers should send the audio stream copied, not converted.
+#
+# Not UploadFile: Starlette spools it to a temp file past 1 MiB, which would
+# put the recording back on disk. The raw body is streamed into ffmpeg.
+# Containers that need seeking (an MP4 with its index at the end) cannot be
+# decoded from a pipe; remuxing to Matroska on the client avoids that too.
+# -hide_banner/-loglevel only trim stderr (so a 400 carries the error, not the
+# build banner); they do not touch the decoded samples.
+_FFMPEG_DECODE = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                  "-threads", "0", "-i", "pipe:0",
+                  "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "pipe:1"]
+
+
+def _drain(pipe, sink: list[bytes]) -> None:
+    for chunk in iter(lambda: pipe.read(1 << 16), b""):
+        sink.append(chunk)
+
+
+async def _decode_request_body(request: Request) -> np.ndarray:
+    proc = subprocess.Popen(_FFMPEG_DECODE, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out: list[bytes] = []
+    err: list[bytes] = []
+    readers = [threading.Thread(target=_drain, args=(proc.stdout, out), daemon=True),
+               threading.Thread(target=_drain, args=(proc.stderr, err), daemon=True)]
+    for r in readers:
+        r.start()
+    received = 0
+    try:
+        async for chunk in request.stream():
+            received += len(chunk)
+            try:
+                await run_in_threadpool(proc.stdin.write, chunk)
+            except BrokenPipeError:
+                break  # ffmpeg gave up; its exit code and stderr say why
+    except ClientDisconnect:
+        proc.kill()
+        raise HTTPException(status_code=400, detail="client disconnected mid-upload")
+    finally:
+        try:
+            proc.stdin.close()
+        except BrokenPipeError:
+            pass
+    rc = await run_in_threadpool(proc.wait)
+    for r in readers:
+        r.join()
+    if rc != 0:
+        tail = b"".join(err)[-800:].decode(errors="replace")
+        raise HTTPException(status_code=400, detail=f"ffmpeg could not decode the upload ({received} bytes): {tail}")
+    audio = np.frombuffer(b"".join(out), np.int16).flatten().astype(np.float32) / 32768.0
+    if audio.size == 0:
+        raise HTTPException(status_code=400, detail=f"upload decoded to no audio ({received} bytes received)")
+    log.info(f"decoded upload: {received / 1e6:.1f} MB -> {audio.size / 16000.0:.1f}s of audio")
+    return audio
+
+
+@app.post("/transcribe_upload", response_model=TranscribeResponse)
+async def transcribe_upload(
+    request: Request,
+    language: str | None = None,
+    batch_size: int | None = None,
+    align: bool = True,
+    diarize: bool = False,
+    min_speakers: int | None = None,
+    max_speakers: int | None = None,
+) -> TranscribeResponse:
+    # Same fail-fast as /transcribe, before reading a byte of the body.
+    if diarize and not _DIARIZE_AVAILABLE:
+        raise HTTPException(status_code=503, detail=_DIARIZE_ERR)
+    opts = TranscribeRequest(audio_path="<upload>", language=language, batch_size=batch_size,
+                             align=align, diarize=diarize,
+                             min_speakers=min_speakers, max_speakers=max_speakers)
+    audio = await _decode_request_body(request)
+    return await run_in_threadpool(_transcribe_impl, audio, opts)
+
+
+def _transcribe_impl(audio: np.ndarray, req: TranscribeRequest) -> TranscribeResponse:
+    """Everything after decoding, shared by both endpoints so they cannot drift."""
+    batch_size = req.batch_size if req.batch_size is not None else DEFAULT_BATCH_SIZE
+    log.info(f"transcribe lang={req.language} batch={batch_size} align={req.align} diarize={req.diarize}")
     duration_s = len(audio) / 16000.0  # whisperx resamples to 16kHz
 
     # Pass 1: transcription

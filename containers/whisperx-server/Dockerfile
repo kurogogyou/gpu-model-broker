@@ -7,11 +7,11 @@
 # build-arg is silently ignored):
 #   docker buildx build \
 #     --secret id=hf_token,src=/home/mario/.config/gpu-broker/hf-token \
-#     -t gpu-broker/whisperx-server:0.2.1 \
+#     -t gpu-broker/whisperx-server:0.3.0 \
 #     containers/whisperx-server/
 # Transcribe+align only (no diarization), explicit:
 #   docker buildx build --build-arg WITH_DIARIZATION=0 \
-#     -t gpu-broker/whisperx-server:0.2.1-noattr containers/whisperx-server/
+#     -t gpu-broker/whisperx-server:0.3.0-noattr containers/whisperx-server/
 #
 # Run:    docker run --rm --gpus all -p 8083:8083 \
 #             -e HF_TOKEN=hf_xxx \
@@ -56,8 +56,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 -m pip install --no-cache-dir --upgrade pip==24.3.1
 
 WORKDIR /app
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt constraints.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 # The Phase 2.5/Phase 4 `pip uninstall nvidia-*-cu12` block was REMOVED
 # 2026-08-28 with the CUDA 12.8 rebase. It stripped cu12 sibling wheels as
