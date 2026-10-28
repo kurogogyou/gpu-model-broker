@@ -13,6 +13,6 @@ if [ -f "$VENV_DIR/bin/activate" ]; then
     echo "  Run: python -m broker  (or systemctl --user start gpu-broker)"
 else
     echo "Error: venv not found at $VENV_DIR"
-    echo "Create it: python3 -m venv $VENV_DIR && $VENV_DIR/bin/pip install -r $SRC_DIR/requirements.txt"
+    echo "Create it: python3 -m venv $VENV_DIR && $VENV_DIR/bin/pip install -r $SRC_DIR/requirements.txt -c $SRC_DIR/constraints.txt"
     return 1 2>/dev/null || exit 1
 fi

@@ -12,7 +12,7 @@ VRAM-aware orchestrator for sharing a single consumer GPU between multiple model
 # Install (one-time on a fresh host)
 git clone <this repo> /opt/brain/src/gpu-broker
 python3 -m venv /opt/fast/venvs/gpu-broker
-/opt/fast/venvs/gpu-broker/bin/pip install -r requirements.txt
+/opt/fast/venvs/gpu-broker/bin/pip install -r requirements.txt -c constraints.txt
 cp systemd/gpu-broker.service ~/.config/systemd/user/
 # Worker images: copy them from a running broker host rather than rebuilding,
 # so every host serves byte-identical weights (they are baked into the images):
