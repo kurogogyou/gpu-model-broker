@@ -164,7 +164,7 @@ def _fmt(gpus: list[GpuInfo]) -> str:
     return ", ".join(f"{g.name} {g.total_mb}MiB ({g.uuid})" for g in gpus)
 
 
-def resolve_placement(selector: str | None, inventory: list[GpuInfo],
+def resolve_placement(selector: str | list[str] | None, inventory: list[GpuInfo],
                       role: str = "?") -> str:
     """Which GPU UUID a role runs on. THE single placement decision.
 
@@ -198,9 +198,17 @@ def resolve_placement(selector: str | None, inventory: list[GpuInfo],
             f"model ends up on a 16 GB card. Installed: {_fmt(inventory)}"
         )
 
-    matches = match_selector(selector, inventory)
-    if len(matches) == 1:
-        return matches[0]
+    # A list is an ordered preference: the first entry matching exactly one
+    # installed card wins. An entry matching SEVERAL cards is an error, not a
+    # reason to try the next one -- that would silently skip an ambiguity.
+    prefs = [selector] if isinstance(selector, str) else list(selector)
+    matches: list[str] = []
+    for pref in prefs:
+        matches = match_selector(pref, inventory)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            break
 
     if not matches and len(inventory) == 1:
         only = inventory[0]

@@ -39,7 +39,18 @@ class RoleConfig(BaseModel):
     # second card is present, and PCI paths renumber on a slot move.
     # None = every GPU visible, which is the pre-multi-GPU behaviour and is only
     # safe while exactly one card is installed.
-    gpu_selector: str | None = None
+    # A LIST is an ordered preference (added 2026-10-28): the first entry that
+    # matches exactly one installed card wins. It lets one roles.yaml serve hosts
+    # with different cards ("3090" on Scully, "3060" on SASHA) without the
+    # sole-card fallback warning, and pins correctly once a host has two cards.
+    gpu_selector: str | list[str] | None = None
+
+    @field_validator("gpu_selector")
+    @classmethod
+    def _non_empty_selector(cls, v):
+        if isinstance(v, list) and (not v or not all(isinstance(x, str) and x for x in v)):
+            raise ValueError("gpu_selector list must be non-empty strings; omit the key to unpin")
+        return v
 
     # Extra bind mounts, host_path -> container_path. Previously every mount was
     # hardcoded per-role inside docker_mgr; roles needing their own storage (the

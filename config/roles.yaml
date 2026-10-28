@@ -58,11 +58,11 @@
 roles:
 
   embed:
-    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
-    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
-    # sole card silently. The old "5060 Ti" pin matched no host and logged a
-    # fallback WARNING on every acquire. A second card in one box makes an
-    # unpinned role a hard error (resolve_placement), so re-pin then.
+    # Ordered preference (2026-10-28): the 3090 where it exists, else the 3060.
+    # One file serves Scully and SASHA with no fallback warning, and stays
+    # correct when Scully gains the 5060 Ti (which is kept for Strata-style
+    # engines outside the broker, so encoders never land on it by accident).
+    gpu_selector: ["3090", "3060"]
     image: gpu-broker/tei-embed:0.2.0
     port: 8081
     loaded_mb: 1200
@@ -72,11 +72,11 @@ roles:
     enabled: true
 
   rerank:
-    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
-    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
-    # sole card silently. The old "5060 Ti" pin matched no host and logged a
-    # fallback WARNING on every acquire. A second card in one box makes an
-    # unpinned role a hard error (resolve_placement), so re-pin then.
+    # Ordered preference (2026-10-28): the 3090 where it exists, else the 3060.
+    # One file serves Scully and SASHA with no fallback warning, and stays
+    # correct when Scully gains the 5060 Ti (which is kept for Strata-style
+    # engines outside the broker, so encoders never land on it by accident).
+    gpu_selector: ["3090", "3060"]
     image: gpu-broker/bge-reranker:0.2.0
     port: 8082
     loaded_mb: 1200
@@ -87,11 +87,11 @@ roles:
     enabled: true
 
   transcribe:
-    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
-    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
-    # sole card silently. The old "5060 Ti" pin matched no host and logged a
-    # fallback WARNING on every acquire. A second card in one box makes an
-    # unpinned role a hard error (resolve_placement), so re-pin then.
+    # Ordered preference (2026-10-28): the 3090 where it exists, else the 3060.
+    # One file serves Scully and SASHA with no fallback warning, and stays
+    # correct when Scully gains the 5060 Ti (which is kept for Strata-style
+    # engines outside the broker, so encoders never land on it by accident).
+    gpu_selector: ["3090", "3060"]
     image: gpu-broker/whisperx-server:0.3.0
     port: 8083
     loaded_mb: 0            # lazy on /acquire; no always-on residency
