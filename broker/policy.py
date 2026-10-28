@@ -152,6 +152,8 @@ def _split_implies(state: State, implies: list[str]) -> tuple[list[str], list[st
     to_start: list[str] = []
     to_touch: list[str] = []
     for r in implies:
+        if r in state.starting:
+            continue  # another acquire is already cold-starting it
         if state.is_loaded(r):
             to_touch.append(r)
         else:

@@ -1,7 +1,8 @@
 """FastAPI app — the broker HTTP entrypoint.
 
 5 endpoints + a /health for the broker itself. All state transitions go through
-State.lock so eviction + acquire don't race.
+State.lock so eviction + acquire don't race; cold starts run outside it, with their
+VRAM reserved under it (state.StartTicket).
 
 Run via `python -m broker` (see __main__.py) or `uvicorn broker.app:app`.
 """
@@ -21,7 +22,7 @@ from pydantic import BaseModel, Field
 from . import __version__, config, observability, policy
 from .docker_mgr import DockerManager
 from . import gpu_ledger
-from .state import State, candidates_to_stop_for_idle
+from .state import StartTicket, State, candidates_to_stop_for_idle
 
 logging.basicConfig(
     level=os.environ.get("BROKER_LOG_LEVEL", "INFO").upper(),
@@ -254,78 +255,124 @@ async def acquire(req: AcquireRequest):
             status_code=409,
             detail=f"role {req.role} is declared but disabled (enabled: false)",
         )
-    async with state.lock:
-        plan = policy.plan_acquire(state, req.role)
-        if not plan.feasible:
-            log.warning("acquire infeasible role=%s reason=%s", req.role, plan.infeasible_reason)
-            raise HTTPException(
-                status_code=503,
-                detail=InfeasibleResponse(
-                    reason=plan.infeasible_reason or "infeasible",
-                    # Free VRAM on the TARGET card, not the cross-card sum —
-                    # reporting the sum here would show plenty free while
-                    # refusing the acquire, which is the pooling illusion.
-                    free_mb=(state.vram_budget_free_mb(plan.gpu_uuid)
-                             if plan.gpu_uuid else state.vram_budget_free_mb()),
-                    would_need_evict=plan.to_evict,
-                ).model_dump(),
-            )
+    # Planning, VRAM reservation and handle creation happen under the lock; the
+    # slow part (container start + health wait, 8-27 s cold) runs outside it.
+    # Until 2026-10-28 the whole cold start held the lock, so every acquire --
+    # even of an already-warm role -- queued behind any cold start in flight: a
+    # WhisperX load stalled interactive searches for its full duration.
+    cold_start_total = 0
+    evicted: list[str] = []
+    warmed: list[str] = []
+    while True:
+        wait_on: StartTicket | None = None
+        async with state.lock:
+            if req.role in state.starting:
+                wait_on = state.starting[req.role]      # someone is starting it
+            else:
+                cfg = state.cfg.roles[req.role]
+                busy = [r for r in cfg.evict_on_acquire if r in state.starting]
+                if busy:
+                    # A role we must evict is mid-start; evicting a half-started
+                    # worker would race it. Let it finish, then plan again.
+                    wait_on = state.starting[busy[0]]
+            if wait_on is None:
+                plan = policy.plan_acquire(state, req.role)
+                if not plan.feasible:
+                    pending = [t for t in state.starting.values()
+                               if plan.gpu_uuid is None or t.gpu_uuid == plan.gpu_uuid]
+                    if pending:
+                        # Infeasible only because of reservations in flight; once
+                        # they land, their workers become evictable. Retry then.
+                        wait_on = pending[0]
+                    else:
+                        log.warning("acquire infeasible role=%s reason=%s",
+                                    req.role, plan.infeasible_reason)
+                        raise HTTPException(
+                            status_code=503,
+                            detail=InfeasibleResponse(
+                                reason=plan.infeasible_reason or "infeasible",
+                                # Free VRAM on the TARGET card, not the cross-card
+                                # sum -- the sum would show plenty free while
+                                # refusing, which is the pooling illusion.
+                                free_mb=(state.vram_budget_free_mb(plan.gpu_uuid)
+                                         if plan.gpu_uuid else state.vram_budget_free_mb()),
+                                would_need_evict=plan.to_evict,
+                            ).model_dump(),
+                        )
+            if wait_on is None:
+                # 1. Evictions (docker stop is seconds, not a model load; keeping
+                #    it under the lock keeps the freed VRAM and the plan in step).
+                for victim_role in plan.to_evict:
+                    victim = state.workers.get(victim_role)
+                    if victim is None:
+                        continue
+                    log.info("evicting role=%s for acquire of %s", victim_role, req.role)
+                    await asyncio.to_thread(state.docker.stop_worker, victim.handle.container)
+                    state.remove_worker(victim_role)
+                    evicted.append(victim_role)
+                # 2. Reserve every cold start this acquire needs.
+                to_start = ([req.role] if plan.will_start else []) + plan.to_warm_implies
+                tickets = [state.begin_start(r) for r in to_start]
+                for implied_role in plan.to_touch_implies:
+                    state.touch_worker(implied_role)
+                if not tickets:
+                    state.touch_worker(req.role)
+                    worker = state.workers[req.role]
+                    client_h = state.create_handle(req.role, req.client_id, req.hold_seconds)
+                    break
 
-        cold_start_total = 0
+        if wait_on is not None:
+            await wait_on.done.wait()
+            if wait_on.error and wait_on.role == req.role:
+                raise HTTPException(status_code=500,
+                                    detail=f"cold start of {req.role} failed: {wait_on.error}")
+            continue
 
-        # 1. Evictions
-        for victim_role in plan.to_evict:
-            victim = state.workers.get(victim_role)
-            if victim is None:
-                continue
-            log.info("evicting role=%s for acquire of %s", victim_role, req.role)
-            await asyncio.to_thread(state.docker.stop_worker, victim.handle.container)
-            state.remove_worker(victim_role)
-
-        # 2. Start target (or just touch)
-        if plan.will_start:
-            cfg = state.cfg.roles[req.role]
+        # 3. Cold starts, outside the lock. The target first, then implies.
+        for t in tickets:
+            rcfg = state.cfg.roles[t.role]
             start_t = time.monotonic()
-            handle = await asyncio.to_thread(state.docker.start_worker, req.role, cfg)
-            worker = state.add_worker(req.role, handle)
-            wait_ms = await _wait_for_worker_health(
-                worker.endpoint, WORKER_HEALTH_TIMEOUT_S,
-                state.cfg.roles[req.role].health_path,
-            )
-            cold_start_total += int((time.monotonic() - start_t) * 1000)
-        else:
-            state.touch_worker(req.role)
-            worker = state.workers[req.role]
+            try:
+                handle = await asyncio.to_thread(state.docker.start_worker, t.role, rcfg)
+            except Exception as exc:
+                async with state.lock:
+                    state.end_start(t, error=str(exc))
+                    for rest in tickets[tickets.index(t) + 1:]:
+                        state.end_start(rest, error="aborted: an earlier start failed")
+                raise
+            try:
+                await _wait_for_worker_health(
+                    f"http://127.0.0.1:{rcfg.port}", WORKER_HEALTH_TIMEOUT_S, rcfg.health_path)
+            except Exception as exc:
+                async with state.lock:
+                    # Registered anyway, as before: the idle sweep stops it.
+                    state.add_worker(t.role, handle)
+                    state.end_start(t, error=str(exc))
+                    for rest in tickets[tickets.index(t) + 1:]:
+                        state.end_start(rest, error="aborted: an earlier start failed")
+                raise
+            async with state.lock:
+                state.add_worker(t.role, handle)
+                state.end_start(t)
+            if t.role == req.role:
+                cold_start_total += int((time.monotonic() - start_t) * 1000)
+            else:
+                warmed.append(t.role)
+        # Loop once more under the lock to touch + create the handle (the role
+        # is resident now; a concurrent eviction in between is replanned).
 
-        # 3. Implies warming (e.g. rerank -> embed)
-        warmed: list[str] = []
-        for implied_role in plan.to_touch_implies:
-            state.touch_worker(implied_role)
-        for implied_role in plan.to_warm_implies:
-            icfg = state.cfg.roles[implied_role]
-            ihandle = await asyncio.to_thread(state.docker.start_worker, implied_role, icfg)
-            iworker = state.add_worker(implied_role, ihandle)
-            await _wait_for_worker_health(
-                iworker.endpoint, WORKER_HEALTH_TIMEOUT_S,
-                state.cfg.roles[implied_role].health_path,
-            )
-            warmed.append(implied_role)
+    log.info("acquired role=%s client=%s handle=%s evicted=%s warmed=%s cold_ms=%d",
+             req.role, req.client_id, client_h.handle_id[:8],
+             evicted, warmed, cold_start_total)
 
-        # 4. Create client handle
-        client_h = state.create_handle(req.role, req.client_id, req.hold_seconds)
-
-        log.info("acquired role=%s client=%s handle=%s evicted=%s warmed=%s cold_ms=%d",
-                 req.role, req.client_id, client_h.handle_id[:8],
-                 plan.to_evict, warmed, cold_start_total)
-
-        return AcquireResponse(
-            handle=client_h.handle_id,
-            endpoint=worker.endpoint,
-            role=req.role,
-            evicted=plan.to_evict,
-            warmed_implies=warmed,
-            cold_start_ms=cold_start_total,
-        )
+    return AcquireResponse(
+        handle=client_h.handle_id,
+        endpoint=worker.endpoint,
+        role=req.role,
+        evicted=evicted,
+        warmed_implies=warmed,
+        cold_start_ms=cold_start_total,
+    )
 
 
 @app.post("/release", status_code=status.HTTP_204_NO_CONTENT)

@@ -53,6 +53,19 @@ class ClientHandle:
 
 
 @dataclass
+class StartTicket:
+    """A cold start in flight. Its VRAM is reserved from the moment the plan is
+    made (under State.lock), but the container start and health wait run OUTSIDE
+    the lock, so a 20 s model load no longer stalls every other /acquire. Other
+    acquires of the same role wait on `done` instead of starting it twice."""
+    role: str
+    loaded_mb: int
+    gpu_uuid: str | None
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    error: str | None = None
+
+
+@dataclass
 class State:
     cfg: BrokerConfig
     docker: DockerManager
@@ -64,6 +77,9 @@ class State:
     handles: dict[str, ClientHandle] = field(default_factory=dict)
     pinned_roles: set[str] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # role -> cold start in flight (see StartTicket). Counted against the VRAM
+    # budget like a resident worker, but not acquirable until it is healthy.
+    starting: dict[str, StartTicket] = field(default_factory=dict)
 
     # ---------- introspection ----------
 
@@ -78,8 +94,11 @@ class State:
 
     def total_loaded_vram_mb(self, gpu_uuid: str | None = None) -> int:
         """loaded_mb of resident workers, optionally scoped to one GPU."""
-        return sum(w.cfg.loaded_mb for w in self.workers.values()
-                   if gpu_uuid is None or w.gpu_uuid == gpu_uuid)
+        resident = sum(w.cfg.loaded_mb for w in self.workers.values()
+                       if gpu_uuid is None or w.gpu_uuid == gpu_uuid)
+        reserved = sum(t.loaded_mb for t in self.starting.values()
+                       if gpu_uuid is None or t.gpu_uuid == gpu_uuid)
+        return resident + reserved
 
     def gpu_for_role(self, role: str) -> str:
         """Which GPU `role` is charged against.
@@ -139,6 +158,20 @@ class State:
                    idle_shutdown_at=shutdown_at, gpu_uuid=self.gpu_for_role(role))
         self.workers[role] = w
         return w
+
+    def begin_start(self, role: str) -> StartTicket:
+        """Reserve VRAM for a cold start. Call under the lock."""
+        t = StartTicket(role=role, loaded_mb=self.cfg.roles[role].loaded_mb,
+                        gpu_uuid=self.gpu_for_role(role))
+        self.starting[role] = t
+        return t
+
+    def end_start(self, ticket: StartTicket, error: str | None = None) -> None:
+        """Drop the reservation and wake waiters. Call under the lock, AFTER
+        add_worker on success, so the VRAM is never uncounted in between."""
+        self.starting.pop(ticket.role, None)
+        ticket.error = error
+        ticket.done.set()
 
     def remove_worker(self, role: str) -> Worker | None:
         return self.workers.pop(role, None)
