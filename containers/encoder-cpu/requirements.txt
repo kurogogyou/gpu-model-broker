@@ -1,0 +1,8 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.15.0+cpu
+transformers==4.57.6
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+numpy==2.4.6
+# Only for re-running export_variants.py / bench_variants.sh:
+# optimum-intel[openvino,nncf]  optimum[onnxruntime]  onnxruntime  sentence-transformers  datasets

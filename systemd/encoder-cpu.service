@@ -1,0 +1,24 @@
+[Unit]
+# CPU encoder fallback for RAGLite on a host with no GPU (MIKASA). Serves
+# bge-m3 embeddings + bge-reranker-v2-m3 on 127.0.0.1:8091 in the GPU workers'
+# wire formats; models load on first request and unload after 30 idle minutes,
+# so it costs ~no RAM while the GPU path is up. docs/host-routing.md.
+Description=encoder-cpu: RAGLite CPU fallback (embed + rerank, 127.0.0.1:8091)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/brain/src/gpu-broker/containers/encoder-cpu
+Environment=ENCODER_RUNTIME=torch
+Environment=ENCODER_MODEL_DIR=/opt/fast/models/encoder-cpu/torch-fp32
+Environment=ENCODER_THREADS=8
+Environment=ENCODER_IDLE_UNLOAD_S=1800
+ExecStart=/opt/fast/venvs/encoder-cpu/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8091 --log-level warning
+Restart=on-failure
+RestartSec=10
+# Interactive searches only: never let it starve the L2 host.
+Nice=5
+MemoryMax=8G
+
+[Install]
+WantedBy=default.target
