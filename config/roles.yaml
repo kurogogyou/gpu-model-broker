@@ -58,12 +58,11 @@
 roles:
 
   embed:
-    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
-    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
-    # card is installed: a selector that matches nothing falls back to
-    # the SOLE installed card (gpu_ledger.resolve_placement), so this
-    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
-    gpu_selector: "5060 Ti"
+    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
+    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
+    # sole card silently. The old "5060 Ti" pin matched no host and logged a
+    # fallback WARNING on every acquire. A second card in one box makes an
+    # unpinned role a hard error (resolve_placement), so re-pin then.
     image: gpu-broker/tei-embed:0.2.0
     port: 8081
     loaded_mb: 1200
@@ -73,12 +72,11 @@ roles:
     enabled: true
 
   rerank:
-    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
-    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
-    # card is installed: a selector that matches nothing falls back to
-    # the SOLE installed card (gpu_ledger.resolve_placement), so this
-    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
-    gpu_selector: "5060 Ti"
+    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
+    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
+    # sole card silently. The old "5060 Ti" pin matched no host and logged a
+    # fallback WARNING on every acquire. A second card in one box makes an
+    # unpinned role a hard error (resolve_placement), so re-pin then.
     image: gpu-broker/bge-reranker:0.2.0
     port: 8082
     loaded_mb: 1200
@@ -89,12 +87,11 @@ roles:
     enabled: true
 
   transcribe:
-    # Pinned 2026-08-28 to the intended two-card layout (encoders on the
-    # 5060 Ti, LLM on the 3090). Safe to state now even though only one
-    # card is installed: a selector that matches nothing falls back to
-    # the SOLE installed card (gpu_ledger.resolve_placement), so this
-    # works unchanged on a 5060-Ti-only box, a 3090-only box, or both.
-    gpu_selector: "5060 Ti"
+    # Unpinned 2026-10-28: this file is shared by every broker host (Scully's
+    # 3090, SASHA's 3060), each with ONE card, and an unpinned role goes to the
+    # sole card silently. The old "5060 Ti" pin matched no host and logged a
+    # fallback WARNING on every acquire. A second card in one box makes an
+    # unpinned role a hard error (resolve_placement), so re-pin then.
     image: gpu-broker/whisperx-server:0.3.0
     port: 8083
     loaded_mb: 0            # lazy on /acquire; no always-on residency
@@ -263,12 +260,23 @@ gpu:
   #
   # Keys are matched like `gpu_selector`: a full UUID, or a case-insensitive
   # substring of the card NAME. Never an index. An entry whose card is not
-  # installed is simply INACTIVE -- which is how the 3090 entry sits dormant
-  # below while the 5060 Ti is in the box, and why swapping the cards back
-  # requires no edit to this file. An installed card with NO entry is a hard
+  # installed is simply INACTIVE, which is what lets ONE copy of this file serve
+  # every broker host: Scully (3090) and SASHA (3060) each activate their own
+  # entry, and moving a card between hosts needs no edit. An installed card with NO entry is a hard
   # startup failure, not a default: a card the broker cannot budget is a card
   # it will over-commit.
   cards:
+
+    "3060":
+      reserved_for_host_mb: 1024
+      # SASHA's RTX 3060 12 GB (in Scully 2026-10-03 -> 10-12, now SASHA).
+      # Same absolute reserve as the 3090: it does not shrink with VRAM.
+      # Measured idle, nothing resident: total 12288 | used 18 | free 11893
+      #   -> 377 MiB driver hold-back (the 3090 measured 451), + headroom.
+      # Budget 12288 - 1024 = 11264 MiB; plan roles against ~10.5 GiB.
+      # The headroom half is a judgement call until the encoders are benched on
+      # this card. No junction/VRAM temperature is readable on GA106, so it
+      # cannot be thermally screened like the 3090.
 
     "3090":
       reserved_for_host_mb: 1024

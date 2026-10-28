@@ -14,6 +14,9 @@ git clone <this repo> /opt/brain/src/gpu-broker
 python3 -m venv /opt/fast/venvs/gpu-broker
 /opt/fast/venvs/gpu-broker/bin/pip install -r requirements.txt
 cp systemd/gpu-broker.service ~/.config/systemd/user/
+# Worker images: copy them from a running broker host rather than rebuilding,
+# so every host serves byte-identical weights (they are baked into the images):
+#   ssh scully 'docker save gpu-broker/whisperx-server:0.3.0' | docker load
 
 # Start
 systemctl --user daemon-reload
@@ -199,6 +202,7 @@ docker stop gpu-broker-transcribe                          # forces cold-restart
 
 | Item | Path |
 |---|---|
+| Hosts | **Scully** (RTX 3090, always-up GPU host) and **SASHA** (RTX 3060, WoL-woken). Same checkout, same `config/roles.yaml`: each host activates the `cards:` entry for the card it has, and roles are unpinned so they go to that sole card. Host prerequisites: Docker + `nvidia-container-toolkit` enabled, `/opt/fast/venvs/` writable by the user, user linger on, `/opt/brain/repo/env/.env` carrying `HF_TOKEN` |
 | Broker code | `/opt/brain/src/gpu-broker/` |
 | Broker venv | `/opt/fast/venvs/gpu-broker/` (only `fastapi`, `uvicorn`, `docker`, `pydantic`, `PyYAML`, `httpx`) |
 | Worker images | local Docker, tagged `gpu-broker/{tei-embed,bge-reranker,whisperx-server}:0.2.0` |
