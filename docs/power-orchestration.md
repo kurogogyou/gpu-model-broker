@@ -13,7 +13,7 @@ None of this is urgent: every host is owned by one person who can power it off b
 | Piece | Where | Knows about |
 |---|---|---|
 | `transcribe_remote.sh` wake + poweroff + boot-id lease | `ai-transcriber` repo, runs on the client | its own chain only |
-| `gpu_job.sh` host selection, wake, poweroff | brain vault `Mind/tools/host/`, runs on MIKASA | its own job only |
+| `gpu_job.sh` host selection, wake, poweroff (busy check since 2026-11-05, below) | brain vault `Mind/tools/host/`, runs on MIKASA | its own job, plus a `/status` sample |
 | the scoped `poweroff` sudoers rule | `/etc/sudoers.d/90-mario-poweroff` on each GPU host | nothing |
 | **the broker** | this repo | **every client on its host, and nothing about power** |
 
@@ -24,6 +24,8 @@ The last row is the whole problem. The broker is the only process that can see a
 `transcribe_remote.sh` is the more developed of the two. It probes ssh; if the host is down it sends a WoL packet, and on exit it powers the host off again. Chained runs share one boot through a lease file keyed on the host's `/proc/sys/kernel/random/boot_id`, so a lease cannot survive a reboot or be replayed from a stale file, and a lease is only ever taken by the run that did the waking: a host that was already up belongs to whoever turned it on.
 
 That last rule is what makes it safe today, and it is also exactly where it stops scaling. "Whoever turned it on" is answered from `$XDG_RUNTIME_DIR` on one client. A second client's lease directory is invisible, on another machine, under another user. **There is no place where the question "who turned this host on" has an authoritative answer.** With one client the client's private belief and the truth coincide, which is why nothing has gone wrong yet.
+
+**`gpu_job.sh` had no guard at all until 2026-11-05.** It powered off any host it woke without asking the broker, so a `transcribe_remote.sh` run from COLETTE on a host a MIKASA job had woken died when that job ended. Unlike the race below, that needed no unlucky timing, only overlap. It now samples `/status` before restoring its tunnel and powers off only after two idle samples 15 s apart, waiting up to 30 min, else it leaves the host on. Two samples narrow hole 1 below without closing it. Nightly work on MIKASA goes through `gpu_nightly.sh`, which runs every step in one `gpu_job.sh` run, so a night has one wake and one power decision. Verified live on SASHA 2026-11-05 with a simulated second client.
 
 ## The guard that exists, and its two holes
 
