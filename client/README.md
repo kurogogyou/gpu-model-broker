@@ -36,13 +36,14 @@ with broker.acquire("embed") as h:
         vectors = [d["embedding"] for d in r["data"]]
 ```
 
-For long-running ingest where a stall mid-batch could exceed
-`idle_shutdown_seconds: 300`, pass `hold_seconds`:
-
-```python
-with broker.acquire("embed", hold_seconds=600) as h:
-    ...
-```
+Every handle is a **lease**, renewed from a background thread for as long as
+the `with` block runs (since 2026-11-05). A long job needs nothing extra: it
+keeps the handle however long it takes. `hold_seconds` (default 300) is how long
+a client that dies without releasing keeps its role pinned and the host reading
+as busy, so keep it short rather than sizing it to the job. `hold_seconds=0`
+takes no lease and holds until `/release`, which a crashed client never sends.
+A broker older than `/renew` never expires handles; the client detects that and
+stops renewing.
 
 ### `rerank` — bge-reranker-v2-m3 cross-encoder (`/rerank`)
 

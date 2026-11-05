@@ -18,6 +18,7 @@ import contextlib
 import json
 import logging
 import sys
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Literal
 
@@ -44,9 +45,21 @@ DEFAULT_RELEASE_TIMEOUT_SECONDS = 10
 # Status is a synchronous PG-free read of in-memory state.
 DEFAULT_STATUS_TIMEOUT_SECONDS = 5
 
+# Lease taken by acquire() when the caller passes no hold_seconds. The handle is
+# renewed from a background thread for as long as the with-block runs, so the
+# length bounds only how long a DEAD client keeps its role pinned (and the host
+# reading as busy), not how long a live job may take. Renewed every third of it,
+# capped at 60 s, so a renewal can fail a couple of times before the lease lapses.
+DEFAULT_LEASE_SECONDS = 300
+MAX_RENEW_INTERVAL_SECONDS = 60
+
 
 class BrokerError(RuntimeError):
     """Base class for all broker-side failures (HTTP non-2xx, transport errors)."""
+
+
+class HandleLostError(BrokerError):
+    """/renew found no such handle: it was released, or its lease lapsed."""
 
 
 class InfeasibleError(BrokerError):
@@ -137,11 +150,18 @@ class GpuBrokerClient:
         Always releases — even on exception inside the with-block — so callers
         don't have to wrap in try/finally. If the broker is unreachable during
         release, logs a warning rather than raising (the original exception, if
-        any, is more interesting; broker-side cleanup catches up via idle sweep).
+        any, is more interesting); the handle's lease lapses broker-side.
+
+        The handle is a lease of `hold_seconds` (default DEFAULT_LEASE_SECONDS),
+        renewed in the background while the with-block runs, so a long job keeps
+        it and a killed one loses it within one lease. `hold_seconds=0` takes no
+        lease: the handle lives until /release, the pre-2026-11 behavior, which a
+        crashed client never sends.
         """
+        lease = DEFAULT_LEASE_SECONDS if hold_seconds is None else hold_seconds
         payload: dict[str, Any] = {"role": role, "client_id": self.client_id}
-        if hold_seconds is not None:
-            payload["hold_seconds"] = hold_seconds
+        if lease:
+            payload["hold_seconds"] = lease
         if hint_vram_mb is not None:
             payload["hint_vram_mb"] = hint_vram_mb
 
@@ -169,9 +189,14 @@ class GpuBrokerClient:
             "acquired role=%s endpoint=%s cold_start_ms=%d evicted=%s warmed_implies=%s",
             h.role, h.endpoint, h.cold_start_ms, h.evicted, h.warmed_implies,
         )
+        renewer = _Renewer(self.base, h.handle, lease) if lease else None
+        if renewer:
+            renewer.start()
         try:
             yield h
         finally:
+            if renewer:
+                renewer.stop()
             try:
                 self.release(h.handle)
             except BrokerError as exc:
@@ -190,6 +215,12 @@ class GpuBrokerClient:
             return
         if not (r.status_code == 204 or r.ok):
             raise BrokerError(f"release failed: HTTP {r.status_code}: {r.text[:500]}")
+
+    def renew(self, handle: str, hold_seconds: int | None = None,
+              timeout: float = DEFAULT_RELEASE_TIMEOUT_SECONDS) -> float | None:
+        """Extend a handle's lease; returns the new hold_until. acquire() does
+        this for you. Raises HandleLostError if the broker no longer has it."""
+        return _renew(self._session, self.base, handle, hold_seconds, timeout)
 
     # ----- read-only -----
 
@@ -246,6 +277,59 @@ class GpuBrokerClient:
             free_mb=int(detail.get("free_mb", 0)),
             would_need_evict=list(detail.get("would_need_evict", [])),
         )
+
+
+def _renew(session: requests.Session, base: str, handle: str,
+           hold_seconds: int | None, timeout: float) -> float | None:
+    body: dict[str, Any] = {"handle": handle}
+    if hold_seconds:
+        body["hold_seconds"] = hold_seconds
+    try:
+        r = session.post(f"{base}/renew", json=body, timeout=timeout)
+    except requests.RequestException as exc:
+        raise BrokerError(f"renew transport error: {exc}") from exc
+    if r.status_code == 404:
+        # A broker older than /renew answers 404 too, with FastAPI's own detail.
+        if r.text and "unknown handle" in r.text:
+            raise HandleLostError(f"handle {handle[:8]} is gone (released or lease lapsed)")
+        raise _NoRenewEndpoint()
+    if not r.ok:
+        raise BrokerError(f"renew failed: HTTP {r.status_code}: {r.text[:500]}")
+    return r.json().get("hold_until")
+
+
+class _NoRenewEndpoint(BrokerError):
+    """The broker predates /renew; it never expires handles, so nothing to do."""
+
+
+class _Renewer(threading.Thread):
+    """Keeps one handle's lease alive until stop(). Uses its own Session:
+    requests.Session is not safe to share with the caller's thread."""
+
+    def __init__(self, base: str, handle: str, lease: int):
+        super().__init__(name=f"broker-renew-{handle[:8]}", daemon=True)
+        self.base, self.handle, self.lease = base, handle, lease
+        self.interval = max(1.0, min(MAX_RENEW_INTERVAL_SECONDS, lease / 3))
+        self._stop_evt = threading.Event()
+        self._session = requests.Session()
+
+    def run(self) -> None:
+        while not self._stop_evt.wait(self.interval):
+            try:
+                _renew(self._session, self.base, self.handle, self.lease, DEFAULT_RELEASE_TIMEOUT_SECONDS)
+            except _NoRenewEndpoint:
+                log.debug("broker has no /renew; handle %s is held until release", self.handle[:8])
+                return
+            except HandleLostError as exc:
+                log.warning("%s; the worker may idle out under this job", exc)
+                return
+            except BrokerError as exc:
+                log.warning("lease renewal failed, retrying in %.0fs: %s", self.interval, exc)
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        self.join(timeout=DEFAULT_RELEASE_TIMEOUT_SECONDS + 1)
+        self._session.close()
 
 
 # ===== CLI =====

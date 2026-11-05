@@ -55,6 +55,8 @@ Client A did everything right. It woke the host, it held a valid lease for the c
 
 ### 2. `hold_until` is written and never read
 
+> ✅ **Fixed 2026-11-05 (option B below).** A handle with `hold_seconds` is now a lease: the idle sweep and `/status` drop it once `hold_until` passes, `POST /renew` extends it, and the reference client takes a 300 s lease by default and renews it in the background while its `with` block runs. A killed client's handle now lapses within one lease. `/status` also lists each handle's `client_id` and `hold_until`. Tests: `tests/test_handle_lease.py`. Still open: hole 1 for clients that acquire per batch, and handles taken with no lease (`hold_seconds=0`, or raw `/acquire` callers that omit it), which keep the old until-`/release` contract.
+
 `ClientHandle.hold_until` is computed in `state.create_handle()` from a `hold_seconds` the client may send, and **no code path ever reads it**. Verified 2026-11-05: the only occurrences in `broker/` are the field declaration and the assignment. There is no reaper and no expiry check; `candidates_to_stop_for_idle()` skips any role with a handle, of any age.
 
 Two consequences, pulling in opposite directions:

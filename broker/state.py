@@ -50,6 +50,10 @@ class ClientHandle:
     client_id: str
     acquired_at: float
     hold_until: float | None  # epoch seconds; None = until /release
+    # The lease length. A handle with one lapses at hold_until unless /renew
+    # pushes it forward, so a client that dies without releasing stops pinning
+    # its role (expire_handles). None = the pre-2026-11 contract, until /release.
+    hold_seconds: int | None = None
 
 
 @dataclass
@@ -194,9 +198,37 @@ class State:
             client_id=client_id,
             acquired_at=time.time(),
             hold_until=(time.time() + hold_seconds) if hold_seconds else None,
+            hold_seconds=hold_seconds or None,
         )
         self.handles[h.handle_id] = h
         return h
+
+    def renew_handle(self, handle_id: str, hold_seconds: int | None = None) -> ClientHandle | None:
+        """Push a handle's lease forward by `hold_seconds` (default: its own
+        lease length). A handle with no lease gets one if `hold_seconds` is given."""
+        h = self.handles.get(handle_id)
+        if h is None:
+            return None
+        secs = hold_seconds or h.hold_seconds
+        if secs:
+            h.hold_seconds = secs
+            h.hold_until = time.time() + secs
+        return h
+
+    def expire_handles(self, now: float | None = None) -> list[ClientHandle]:
+        """Drop handles whose lease has lapsed, and start their role's idle clock.
+
+        Until 2026-11-05 hold_until was written and never read, so a client
+        killed between /acquire and /release left its handle here forever: the
+        role stayed resident against the idle sweep and active_handles never
+        returned to 0, so no client would power the host off again."""
+        now = time.time() if now is None else now
+        gone = [h for h in self.handles.values()
+                if h.hold_until is not None and h.hold_until <= now]
+        for h in gone:
+            del self.handles[h.handle_id]
+            self.touch_worker(h.role)
+        return gone
 
     def release_handle(self, handle_id: str) -> ClientHandle | None:
         return self.handles.pop(handle_id, None)

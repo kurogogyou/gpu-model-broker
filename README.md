@@ -105,7 +105,7 @@ Defined in [`config/roles.yaml`](config/roles.yaml). Each role declares its imag
 - **`co_resident_with`**: declarative pairing — these two are expected to run together. The broker won't evict one to make room for the other.
 - **`implies`**: acquiring `rerank` warms `embed` for free (reranking typically follows embedding).
 - **`evict_on_acquire`**: surgical eviction — when this role is acquired, listed roles are stopped first. This is the load-bearing policy on the 8 GiB ceiling.
-- **`idle_shutdown_seconds`**: after the last release, the container is stopped after this many seconds. `active_handles > 0` shields from idle shutdown.
+- **`idle_shutdown_seconds`**: after the last release, the container is stopped after this many seconds. `active_handles > 0` shields from idle shutdown. A handle acquired with `hold_seconds` is a lease: it lapses at `hold_until` unless `/renew` extends it (the reference client renews in the background), so a client that dies without releasing stops shielding its role within one lease. Handles without one live until `/release`.
 - **`enabled: false`**: role is recognized in the config but `/acquire` returns 503 `InfeasibleError`. Useful for staging future workers (the `llm` slot is wired but no image exists).
 
 **Pinning:** during the consumer-migration bridge week (2026-06-13 → 2026-06-20), the `embed` worker is pinned (`POST /admin/pin/embed`) so legacy `brain-rag` callers keep working at `:8081` while the new path lands. Pinned workers are eviction-immune and never idle-shut-down.
@@ -118,7 +118,8 @@ Defined in [`config/roles.yaml`](config/roles.yaml). Each role declares its imag
 |---|---|---|
 | `POST` | `/acquire` | request a worker; starts container if needed, returns endpoint URL + cold-start latency + which workers were evicted |
 | `POST` | `/release` | drop a previously-acquired handle |
-| `GET` | `/status` | inspect VRAM ledger + per-worker state |
+| `POST` | `/renew` | extend a handle's lease (`hold_seconds`, default its own); 404 once released or lapsed |
+| `GET` | `/status` | inspect VRAM ledger + per-worker state + who holds each handle (`handles`) |
 | `POST` | `/admin/pin/{role}` | mark a role eviction-immune (also disables idle shutdown for that role) |
 | `POST` | `/admin/unpin/{role}` | release the pin |
 

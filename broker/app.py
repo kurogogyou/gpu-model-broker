@@ -1,6 +1,6 @@
 """FastAPI app — the broker HTTP entrypoint.
 
-5 endpoints + a /health for the broker itself. All state transitions go through
+6 endpoints + a /health for the broker itself. All state transitions go through
 State.lock so eviction + acquire don't race; cold starts run outside it, with their
 VRAM reserved under it (state.StartTicket).
 
@@ -71,6 +71,25 @@ class ReleaseRequest(BaseModel):
     handle: str
 
 
+class RenewRequest(BaseModel):
+    handle: str
+    # Omitted = extend by the lease length the handle was acquired with.
+    hold_seconds: int | None = Field(default=None, ge=1)
+
+
+class RenewResponse(BaseModel):
+    handle: str
+    hold_until: float | None
+
+
+class HandleStatus(BaseModel):
+    handle: str               # first 8 chars, as in the logs
+    role: str
+    client_id: str
+    acquired_at: float
+    hold_until: float | None  # None = until /release (no lease)
+
+
 class WorkerStatus(BaseModel):
     role: str
     container_id: str
@@ -110,6 +129,17 @@ class StatusResponse(BaseModel):
     workers: list[WorkerStatus]
     pinned_roles: list[str]
     active_handles: int
+    # Who holds what, so a client deciding power can see more than a count.
+    handles: list[HandleStatus] = Field(default_factory=list)
+
+
+def _expire_lapsed(state: State) -> None:
+    """Call under state.lock."""
+    now = time.time()
+    for h in state.expire_handles(now):
+        log.warning("expired handle=%s role=%s client=%s after %.0fs: lease lapsed "
+                    "without /release or /renew", h.handle_id[:8], h.role,
+                    h.client_id, now - h.acquired_at)
 
 
 # ---------- app factory + lifespan ----------
@@ -149,6 +179,7 @@ async def _idle_sweep_loop(state: State) -> None:
         try:
             await asyncio.sleep(IDLE_SWEEP_INTERVAL_S)
             async with state.lock:
+                _expire_lapsed(state)
                 to_stop = candidates_to_stop_for_idle(state)
                 for role in to_stop:
                     w = state.workers[role]
@@ -388,11 +419,25 @@ async def release(req: ReleaseRequest):
     return None
 
 
+@app.post("/renew", response_model=RenewResponse)
+async def renew(req: RenewRequest):
+    """Extend a handle's lease. 404 if it was released or has already lapsed:
+    the client has lost it and should acquire again."""
+    state = _state()
+    async with state.lock:
+        _expire_lapsed(state)
+        h = state.renew_handle(req.handle, req.hold_seconds)
+        if h is None:
+            raise HTTPException(status_code=404, detail="unknown handle")
+    return RenewResponse(handle=h.handle_id, hold_until=h.hold_until)
+
+
 @app.get("/status", response_model=StatusResponse)
 async def get_status():
     state = _state()
     workers_out: list[WorkerStatus] = []
     async with state.lock:
+        _expire_lapsed(state)
         for role, w in state.workers.items():
             rss = observability.container_cpu_rss_mb(w.handle.container_pid) if w.handle.container_pid else None
             workers_out.append(WorkerStatus(
@@ -426,6 +471,11 @@ async def get_status():
             workers=workers_out,
             pinned_roles=sorted(state.pinned_roles),
             active_handles=len(state.handles),
+            handles=[
+                HandleStatus(handle=h.handle_id[:8], role=h.role, client_id=h.client_id,
+                             acquired_at=h.acquired_at, hold_until=h.hold_until)
+                for h in state.handles.values()
+            ],
         )
 
 
