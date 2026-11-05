@@ -54,9 +54,10 @@ Per unit of work Scully is ~25 % cheaper and 2.4× faster; SASHA wins only on id
 | Host selection for batch jobs | brain vault `Mind/tools/host/gpu_job.sh` + `gpu-broker-tunnel@.service` (on MIKASA) | neither host's broker can see the other; the choice is made where the job runs |
 | CPU fallback server | this repo, `containers/encoder-cpu/` (runs on MIKASA) | same wire formats as the GPU workers, so the client switches by base URL |
 | CPU fallback trigger | brain vault `Mind/tools/brain-rag/raglite_mcp_server.py` | the fallback must work exactly when the broker path is down, so it cannot depend on a broker |
-| Remote power | `/etc/sudoers.d/90-mario-poweroff` on Scully and SASHA, WoL from MIKASA `~/bin/wake` | |
+| Remote power | `/etc/sudoers.d/90-mario-poweroff` on Scully and SASHA, WoL from MIKASA `~/bin/wake`, and `transcribe_remote.sh`'s boot-id lease in the `ai-transcriber` repo | decided per client, never by the broker, which is the one process that can see every client on a host. ⚠️ Does not survive a second concurrent client: [`power-orchestration.md`](power-orchestration.md) |
 
 ## Decisions
 
 - **The CPU fallback is not a brokered tier (2026-10-28).** The ledger is GPU-only by design (refuses to start without `nvidia-smi` cards, budgets VRAM), a local broker would contend for the tunnel's fixed ports, and a fallback must not depend on another service being healthy. The fallback server lives here as a worker image so the design sits in one repo; its trigger lives in the client. **Revisit at the Triton spike:** if Triton replaces the serving containers, MIKASA becomes one more host running OpenVINO CPU instances behind the same API, and this split may collapse into a brokered tier.
 - **Cold starts run outside the broker lock** (`a43006b`): a warm acquire no longer waits behind another role's 8–27 s cold start.
+- **Power stays a client decision for now (2026-11-05), and that is a known gap rather than a design.** With one client at a time it is correct; with two it can power a host off under a job, because the `active_handles` guard samples an instant and a batch client drops to zero between acquisitions. Options, and what the planned always-on 3060 box does to the question: [`power-orchestration.md`](power-orchestration.md). ⚠️ The hardware layout in the ladder above predates that plan.
